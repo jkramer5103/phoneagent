@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 AI Voice Agent: Calls a phone number via SIP/RTP, transcribes speech with
-Soniox real-time STT, generates responses with OpenAI GPT Audio via OpenRouter
-(combined LLM + neural TTS in one streaming call). Supports interruption.
+Soniox real-time STT, generates responses with Gemini via OpenRouter,
+and speaks them back using Cartesia Sonic TTS. Supports interruption.
 """
 
-import io
 import os
 import re
 import json
@@ -15,12 +14,10 @@ import struct
 import hashlib
 import random
 import audioop
-import asyncio
-import base64
+import queue
 import threading
-import miniaudio
 import httpx
-import edge_tts
+from cartesia import Cartesia
 from dotenv import load_dotenv
 from websockets.sync.client import connect as ws_connect
 
@@ -38,13 +35,15 @@ RTP_PORT = 16384
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
 LLM_MODEL = "google/gemini-3-flash-preview"  # Smart LLM for text generation
+CARTESIA_VOICE_ID = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"  # Nico - Friendly Agent (German)
 
 SYSTEM_PROMPT = (
-    "You are a friendly AI voice assistant on a phone call. "
-    "Keep your responses concise and conversational — typically 1-3 sentences. "
-    "You speak German.
-    "Be helpful, natural, and engaging."
+    "Du bist ein freundlicher KI-Sprachassistent am Telefon. "
+    "Halte deine Antworten kurz und gesprächig — normalerweise 1-3 Sätze. "
+    "Du sprichst Deutsch. "
+    "Sei hilfsbereit, natürlich und sympathisch."
 )
 
 # --- Shared State ---
@@ -397,38 +396,47 @@ def sip_bye(sock, local_ip, call_id, tag, cseq, to_header):
 
 
 # ============================================================
-# TTS: Text to u-law audio (edge-tts for greeting, GPT Audio for conversation)
+# TTS: Cartesia Sonic (ultra-low latency streaming neural TTS)
 # ============================================================
 
-def text_to_ulaw(text):
-    """Convert text to u-law audio bytes via edge-tts (used for greeting only)."""
+# Persistent Cartesia client and WebSocket (initialized in main)
+cartesia_client = None
+cartesia_ws = None
+
+CARTESIA_SAMPLE_RATE = 44100  # Synthesize at high quality, downsample for RTP
+
+
+def cartesia_tts_ulaw(text):
+    """Convert text to u-law audio via Cartesia Sonic (single shot, for greeting)."""
+    global cartesia_ws
     if not text.strip():
         return b""
 
-    async def _synthesize():
-        mp3_buf = io.BytesIO()
-        communicate = edge_tts.Communicate(text, "de-DE-FlorianMultilingualNeural")
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_buf.write(chunk["data"])
-        return mp3_buf.getvalue()
-
-    mp3_data = asyncio.run(_synthesize())
-    if not mp3_data:
+    pcm_chunks = []
+    try:
+        for output in cartesia_ws.send(
+            model_id="sonic-3",
+            transcript=text,
+            voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+            language="de",
+            output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+        ):
+            if hasattr(output, 'audio') and output.audio:
+                pcm_chunks.append(output.audio)
+    except Exception as e:
+        print(f"[TTS] Cartesia error: {e}")
+        try:
+            cartesia_ws = cartesia_client.tts.websocket()
+        except Exception:
+            pass
         return b""
 
-    decoded = miniaudio.decode(mp3_data, output_format=miniaudio.SampleFormat.SIGNED16,
-                               nchannels=1, sample_rate=8000)
-    pcm = bytes(decoded.samples)
-    return audioop.lin2ulaw(pcm, 2)
-
-
-def pcm16_24k_to_ulaw_8k(pcm_24k):
-    """Convert PCM16 24kHz mono to u-law 8kHz for RTP."""
-    if not pcm_24k:
+    if not pcm_chunks:
         return b""
-    pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
-    return audioop.lin2ulaw(pcm_8k, 2)
+
+    pcm = b"".join(pcm_chunks)
+    pcm8k, _ = audioop.ratecv(pcm, 2, 1, CARTESIA_SAMPLE_RATE, 8000, None)
+    return audioop.lin2ulaw(pcm8k, 2)
 
 
 # ============================================================
@@ -581,79 +589,126 @@ def rtp_receive_thread(rtp_sock, soniox_ws):
 
 
 # ============================================================
-# Soniox STT → Gemini LLM → edge-tts TTS → RTP pipeline
+# Soniox STT → Gemini LLM → Cartesia TTS (streaming) → RTP pipeline
 # ============================================================
 
-# Neural TTS voice (multilingual German, handles English too)
-TTS_VOICE_NAME = "de-DE-FlorianMultilingualNeural"
-
-def tts_speak(text, rtp_sock, remote_ip, remote_port):
-    """Synthesize text with edge-tts, stream u-law audio to RTP. Returns True if fully spoken."""
-    if not text.strip() or state.interrupt_flag or not state.call_active:
-        return False
-
-    # Synthesize with edge-tts (async internally)
-    try:
-        ulaw_audio = text_to_ulaw(text)
-    except Exception as e:
-        print(f"[TTS] Synthesis error: {e}")
-        return False
-
-    if not ulaw_audio:
-        return False
-
-    # Stream via RTP with interruption support
-    state.is_speaking = True
-    CHUNK_SIZE = 160
-
-    for i in range(0, len(ulaw_audio), CHUNK_SIZE):
-        if state.interrupt_flag or not state.call_active:
-            state.is_speaking = False
-            state.speaking_ended_at = time.time()
-            return False
-
-        pkt = ulaw_audio[i:i + CHUNK_SIZE]
-        if len(pkt) < CHUNK_SIZE:
-            pkt += b'\xff' * (CHUNK_SIZE - len(pkt))
-
-        with rtp_state.lock:
-            marker = 0x80 if i == 0 else 0x00
-            rtp_header = struct.pack("!BBHII", 0x80, 0 | marker,
-                                     rtp_state.seq & 0xFFFF,
-                                     rtp_state.timestamp & 0xFFFFFFFF,
-                                     rtp_state.ssrc)
-            rtp_state.seq += 1
-            rtp_state.timestamp += CHUNK_SIZE
-        try:
-            rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
-        except OSError:
-            state.is_speaking = False
-            state.speaking_ended_at = time.time()
-            return False
-        time.sleep(0.02)
-
-    state.is_speaking = False
-    state.speaking_ended_at = time.time()
-    return True
-
-
 def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
-    """Stream text from Gemini, speak each sentence via edge-tts."""
+    """Stream Gemini text → Cartesia continuations → RTP audio, all concurrently."""
     if not user_text.strip():
         return
 
+    global cartesia_ws
     state.llm_busy = True
     state.interrupt_flag = False
     print(f"[LLM] User said: {user_text}")
 
     state.conversation.append({"role": "user", "content": user_text})
-
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + state.conversation[-20:]
 
     full_response = ""
-    spoken_text = ""
-    sentence_buffer = ""
+    audio_q = queue.Queue()  # PCM audio chunks from Cartesia → RTP sender
+    tts_ctx = cartesia_ws.context()
 
+    # --- Thread 1: Receive audio from Cartesia and push to queue ---
+    def audio_receiver():
+        try:
+            for output in tts_ctx.receive():
+                if state.interrupt_flag or not state.call_active:
+                    break
+                if hasattr(output, 'audio') and output.audio:
+                    audio_q.put(output.audio)
+        except Exception as e:
+            print(f"[TTS] Receive error: {e}")
+        audio_q.put(None)  # Sentinel: no more audio
+
+    recv_thread = threading.Thread(target=audio_receiver, daemon=True)
+    recv_thread.start()
+
+    # --- Thread 2: Send RTP packets from audio queue ---
+    spoken_duration = 0.0  # Track how much audio was actually sent
+
+    def rtp_sender():
+        nonlocal spoken_duration
+        pcm_buffer = b""
+        CHUNK_SAMPLES = 160  # 20ms at 8kHz
+        CHUNK_BYTES_44K = CHUNK_SAMPLES * 2 * (CARTESIA_SAMPLE_RATE // 8000)  # Proportional input needed
+        ratecv_state = None
+
+        while True:
+            try:
+                pcm_chunk = audio_q.get(timeout=5)
+            except queue.Empty:
+                break
+            if pcm_chunk is None:
+                break
+            if state.interrupt_flag or not state.call_active:
+                break
+
+            pcm_buffer += pcm_chunk
+
+            # Process in chunks large enough for clean resampling
+            PROCESS_SIZE = CARTESIA_SAMPLE_RATE * 2 // 10  # ~100ms of 44.1kHz PCM16
+            while len(pcm_buffer) >= PROCESS_SIZE:
+                if state.interrupt_flag or not state.call_active:
+                    return
+
+                segment = pcm_buffer[:PROCESS_SIZE]
+                pcm_buffer = pcm_buffer[PROCESS_SIZE:]
+
+                pcm8k, ratecv_state = audioop.ratecv(segment, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
+                ulaw = audioop.lin2ulaw(pcm8k, 2)
+
+                if not state.is_speaking:
+                    state.is_speaking = True
+
+                for j in range(0, len(ulaw), CHUNK_SAMPLES):
+                    if state.interrupt_flag or not state.call_active:
+                        return
+                    pkt = ulaw[j:j + CHUNK_SAMPLES]
+                    if len(pkt) < CHUNK_SAMPLES:
+                        pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
+                    with rtp_state.lock:
+                        rtp_header = struct.pack("!BBHII", 0x80, 0,
+                                                 rtp_state.seq & 0xFFFF,
+                                                 rtp_state.timestamp & 0xFFFFFFFF,
+                                                 rtp_state.ssrc)
+                        rtp_state.seq += 1
+                        rtp_state.timestamp += CHUNK_SAMPLES
+                    try:
+                        rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
+                    except OSError:
+                        return
+                    spoken_duration += 0.02
+                    time.sleep(0.02)
+
+        # Flush remaining buffer
+        if pcm_buffer and not state.interrupt_flag and state.call_active:
+            pcm8k, _ = audioop.ratecv(pcm_buffer, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
+            ulaw = audioop.lin2ulaw(pcm8k, 2)
+            for j in range(0, len(ulaw), CHUNK_SAMPLES):
+                if state.interrupt_flag or not state.call_active:
+                    return
+                pkt = ulaw[j:j + CHUNK_SAMPLES]
+                if len(pkt) < CHUNK_SAMPLES:
+                    pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
+                with rtp_state.lock:
+                    rtp_header = struct.pack("!BBHII", 0x80, 0,
+                                             rtp_state.seq & 0xFFFF,
+                                             rtp_state.timestamp & 0xFFFFFFFF,
+                                             rtp_state.ssrc)
+                    rtp_state.seq += 1
+                    rtp_state.timestamp += CHUNK_SAMPLES
+                try:
+                    rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
+                except OSError:
+                    return
+                spoken_duration += 0.02
+                time.sleep(0.02)
+
+    rtp_thread = threading.Thread(target=rtp_sender, daemon=True)
+    rtp_thread.start()
+
+    # --- Main: Stream Gemini text → Cartesia continuations ---
     try:
         with httpx.Client(timeout=30) as client:
             with client.stream(
@@ -684,48 +739,46 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
                         content = delta.get("content", "")
                         if content:
                             full_response += content
-                            sentence_buffer += content
-
-                            # Speak at sentence boundaries
-                            while True:
-                                match = re.search(r'[.!?]\s', sentence_buffer)
-                                if not match:
-                                    break
-                                idx = match.end()
-                                sentence = sentence_buffer[:idx].strip()
-                                sentence_buffer = sentence_buffer[idx:]
-
-                                if sentence and not state.interrupt_flag:
-                                    print(f"[TTS] Speaking: {sentence}")
-                                    ok = tts_speak(sentence, rtp_sock, remote_ip, remote_port)
-                                    if ok:
-                                        spoken_text += sentence + " "
-                                    else:
-                                        break
+                            # Stream each token directly to Cartesia
+                            try:
+                                tts_ctx.send(
+                                    model_id="sonic-3",
+                                    transcript=content,
+                                    voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+                                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+                                    language="de",
+                                    continue_=True,
+                                )
+                            except Exception as e:
+                                print(f"[TTS] Send error: {e}")
+                                break
                     except (json.JSONDecodeError, IndexError, KeyError):
                         continue
 
     except Exception as e:
         print(f"[LLM] Error: {e}")
-        state.llm_busy = False
-        return
 
-    # Speak remaining text
-    remaining = sentence_buffer.strip()
-    if remaining and not state.interrupt_flag and state.call_active:
-        print(f"[TTS] Speaking remainder: {remaining}")
-        ok = tts_speak(remaining, rtp_sock, remote_ip, remote_port)
-        if ok:
-            spoken_text += remaining
+    # Signal Cartesia that no more text is coming
+    try:
+        tts_ctx.no_more_inputs()
+    except Exception:
+        pass
 
-    # Record what was actually spoken in conversation history
-    if state.interrupt_flag and spoken_text.strip():
-        interrupted_msg = f"{spoken_text.strip()} [user interrupted here, rest was not spoken]"
-        state.conversation.append({"role": "assistant", "content": interrupted_msg})
-        print(f"[LLM] Interrupted after: {spoken_text.strip()}")
-    elif full_response.strip():
-        state.conversation.append({"role": "assistant", "content": full_response.strip()})
-        print(f"[LLM] Response: {full_response.strip()}")
+    # Wait for audio to finish playing
+    recv_thread.join(timeout=15)
+    rtp_thread.join(timeout=15)
+
+    state.is_speaking = False
+    state.speaking_ended_at = time.time()
+
+    # Record conversation history
+    if full_response.strip():
+        if state.interrupt_flag:
+            state.conversation.append({"role": "assistant", "content": f"{full_response.strip()} [user interrupted]"})
+            print(f"[LLM] Interrupted. Response was: {full_response.strip()}")
+        else:
+            state.conversation.append({"role": "assistant", "content": full_response.strip()})
+            print(f"[LLM] Response: {full_response.strip()}")
 
     state.llm_busy = False
 
@@ -918,10 +971,17 @@ def main():
         t_keepalive.start()
         threads.append(t_keepalive)
 
+        # Initialize Cartesia TTS
+        global cartesia_client, cartesia_ws
+        print("[TTS] Connecting to Cartesia Sonic...")
+        cartesia_client = Cartesia(api_key=CARTESIA_API_KEY)
+        cartesia_ws = cartesia_client.tts.websocket()
+        print("[TTS] Cartesia connected")
+
         # Play greeting
         print("[*] Playing greeting...")
         greeting = "Hallo! Ich bin dein KI Assistent. Wie kann ich dir helfen?"
-        greeting_audio = text_to_ulaw(greeting)
+        greeting_audio = cartesia_tts_ulaw(greeting)
         rtp_send_thread(rtp_sock, remote_rtp_ip, remote_rtp_port, greeting_audio)
         state.conversation.append({"role": "assistant", "content": greeting})
 
@@ -948,6 +1008,10 @@ def main():
             soniox_ws.send(b"")  # Signal end of stream
             time.sleep(0.5)
             soniox_ws.close()
+        except Exception:
+            pass
+        try:
+            cartesia_ws.close()
         except Exception:
             pass
 
