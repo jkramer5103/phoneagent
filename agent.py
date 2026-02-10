@@ -29,23 +29,29 @@ from websockets.sync.client import connect as ws_connect
 load_dotenv()
 
 # --- Configuration ---
-SIP_SERVER = "speedport.ip"
-SIP_PORT = 5060
-SIP_URI_USER = "**71"
-AUTH_USER = "nutzer-1@speedport.ip"
-AUTH_PASS = "B-fx3$h-7yH4&42"
-LOCAL_SIP_PORT = 5060
-RTP_PORT = 16384
+SIP_SERVER = os.getenv("SIP_SERVER", "speedport.ip")
+SIP_PORT = int(os.getenv("SIP_PORT", "5060"))
+SIP_URI_USER = os.getenv("SIP_URI_USER", "**71")
+AUTH_USER = os.getenv("AUTH_USER", "nutzer-1@speedport.ip")
+AUTH_PASS = os.getenv("AUTH_PASS", "")
+LOCAL_SIP_PORT = int(os.getenv("LOCAL_SIP_PORT", "5060"))
+RTP_PORT = int(os.getenv("RTP_PORT", "16384"))
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
-LLM_MODEL = "google/gemini-3-flash-preview"  # Smart LLM for text generation
-CARTESIA_VOICE_ID = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"  # Nico - Friendly Agent (German)
+LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-3-flash-preview")
+CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "afa425cf-5489-4a09-8a3f-d3cb1f82150d")
 
-HANGUP_TOKEN = "[HANGUP]"
-INTERRUPT_GRACE_PERIOD = 3.0  # Seconds after agent starts speaking before interruption is allowed
-RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+HANGUP_TOKEN = os.getenv("HANGUP_TOKEN", "[HANGUP]")
+INTERRUPT_GRACE_PERIOD = float(os.getenv("INTERRUPT_GRACE_PERIOD", "3.0"))
+RECORDINGS_DIR = os.getenv("RECORDINGS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings"))
+
+# Audio Configuration
+CARTESIA_SAMPLE_RATE = int(os.getenv("CARTESIA_SAMPLE_RATE", "44100"))
+VOICE_THRESHOLD = int(os.getenv("VOICE_THRESHOLD", "500"))
+INTERRUPT_THRESHOLD = int(os.getenv("INTERRUPT_THRESHOLD", "2000"))
+ECHO_COOLDOWN = float(os.getenv("ECHO_COOLDOWN", "0.8"))
 
 
 # ============================================================
@@ -550,7 +556,6 @@ def sip_bye(sock, local_ip, call_id, tag, cseq, to_header, call_number):
 # TTS: Cartesia Sonic (ultra-low latency streaming neural TTS)
 # ============================================================
 
-CARTESIA_SAMPLE_RATE = 44100  # Synthesize at high quality, downsample for RTP
 
 
 def cartesia_tts_ulaw(text, tts_ws, tts_client):
@@ -694,10 +699,6 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
             rms = audioop.rms(pcm_data, 2)
         except audioop.error:
             rms = 0
-
-        VOICE_THRESHOLD = 500
-        INTERRUPT_THRESHOLD = 2000  # Much louder = definitely the user, not echo
-        ECHO_COOLDOWN = 0.8  # Ignore audio for this long after AI stops speaking
 
         # Suppress VAD during AI speech and echo cooldown period
         in_echo_zone = state.is_speaking or (time.time() - state.speaking_ended_at < ECHO_COOLDOWN)
