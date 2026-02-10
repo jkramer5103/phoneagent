@@ -10,6 +10,8 @@ wheels/
 .venv
 venv
 
-
 # Environment variables
 .env
+
+# Recordings
+recordings

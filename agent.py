@@ -10,6 +10,7 @@ import os
 import re
 import json
 import time
+import wave
 import socket
 import struct
 import hashlib
@@ -44,6 +45,102 @@ CARTESIA_VOICE_ID = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"  # Nico - Friendly Ag
 
 HANGUP_TOKEN = "[HANGUP]"
 INTERRUPT_GRACE_PERIOD = 3.0  # Seconds after agent starts speaking before interruption is allowed
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+
+
+# ============================================================
+# Call Recording
+# ============================================================
+
+class CallRecorder:
+    """Records both sides of a call by capturing raw u-law RTP audio with timestamps."""
+
+    def __init__(self):
+        self.start_time = None
+        self.inbound = []   # (offset_samples, ulaw_bytes) from remote party
+        self.outbound = []  # (offset_samples, ulaw_bytes) from agent
+        self.lock = threading.Lock()
+
+    def start(self):
+        self.start_time = time.time()
+
+    def _offset(self):
+        """Current offset in samples (8kHz) since recording started."""
+        if self.start_time is None:
+            return 0
+        return int((time.time() - self.start_time) * 8000)
+
+    def record_inbound(self, ulaw_data):
+        if self.start_time is None:
+            return
+        with self.lock:
+            self.inbound.append((self._offset(), ulaw_data))
+
+    def record_outbound(self, ulaw_data):
+        if self.start_time is None:
+            return
+        with self.lock:
+            self.outbound.append((self._offset(), ulaw_data))
+
+    def save(self, filepath):
+        """Mix inbound + outbound into a single-channel 8kHz 16-bit PCM WAV."""
+        if self.start_time is None:
+            print("[REC] No recording to save")
+            return
+
+        with self.lock:
+            inbound = list(self.inbound)
+            outbound = list(self.outbound)
+
+        # Find total length in samples
+        max_sample = 0
+        for offset, data in inbound + outbound:
+            end = offset + len(data)
+            if end > max_sample:
+                max_sample = end
+
+        if max_sample == 0:
+            print("[REC] No audio captured")
+            return
+
+        # Create PCM buffers (16-bit signed, so 2 bytes per sample)
+        pcm_in = bytearray(max_sample * 2)
+        pcm_out = bytearray(max_sample * 2)
+
+        # Decode u-law chunks into PCM buffers at their correct offsets
+        for offset, data in inbound:
+            try:
+                pcm = audioop.ulaw2lin(data, 2)
+                byte_offset = offset * 2
+                end = byte_offset + len(pcm)
+                if end <= len(pcm_in):
+                    pcm_in[byte_offset:end] = pcm
+            except audioop.error:
+                pass
+
+        for offset, data in outbound:
+            try:
+                pcm = audioop.ulaw2lin(data, 2)
+                byte_offset = offset * 2
+                end = byte_offset + len(pcm)
+                if end <= len(pcm_out):
+                    pcm_out[byte_offset:end] = pcm
+            except audioop.error:
+                pass
+
+        # Mix both channels by adding samples (with clipping)
+        mixed = audioop.add(bytes(pcm_in), bytes(pcm_out), 2)
+
+        # Write WAV
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with wave.open(filepath, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(8000)
+            wf.writeframes(mixed)
+
+        duration = max_sample / 8000
+        print(f"[REC] Saved {duration:.1f}s recording to {filepath}")
 
 # --- API Models ---
 class CallRequest(BaseModel):
@@ -75,6 +172,7 @@ class AgentState:
         self.hangup_requested = False
         self.sip_sock = None
         self.sip_call_info = None
+        self.recorder = CallRecorder()
         self.system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self):
@@ -531,6 +629,9 @@ def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio, state, rtp_sta
         except OSError:
             break
 
+        # Record outbound audio
+        state.recorder.record_outbound(chunk)
+
         time.sleep(0.02)
 
     state.is_speaking = False
@@ -561,6 +662,9 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
         payload = data[12:]
         if len(payload) == 0:
             continue
+
+        # Record inbound audio
+        state.recorder.record_inbound(payload)
 
         # Convert u-law to 16-bit PCM for Soniox
         try:
@@ -714,6 +818,7 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
                             rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
                         except OSError:
                             return
+                        state.recorder.record_outbound(pkt)
                         spoken_duration += 0.02
                         time.sleep(0.02)
 
@@ -738,6 +843,7 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
                         rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
                     except OSError:
                         return
+                    state.recorder.record_outbound(pkt)
                     spoken_duration += 0.02
                     time.sleep(0.02)
         finally:
@@ -1198,6 +1304,9 @@ def run_call(call_number: str, objective: str) -> CallResult:
         t_sip.start()
         threads.append(t_sip)
 
+        # Start recording
+        state.recorder.start()
+
         # Step 6: Play greeting IMMEDIATELY (audio was pre-synthesized, threads already listening)
         rtp_send_thread(rtp_sock, remote_rtp_ip, remote_rtp_port, greeting_audio, state, rtp_state)
         state.conversation.append({"role": "assistant", "content": greeting})
@@ -1237,6 +1346,15 @@ def run_call(call_number: str, objective: str) -> CallResult:
     finally:
         rtp_sock.close()
         sip_sock.close()
+
+    # Save call recording
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_number = call_number.replace("+", "").replace(" ", "")
+    recording_path = os.path.join(RECORDINGS_DIR, f"{timestamp}_{safe_number}.wav")
+    try:
+        state.recorder.save(recording_path)
+    except Exception as e:
+        print(f"[REC] Error saving recording: {e}")
 
     print("[*] Call finished. Generating summary...")
     summary, objective_completed = summarize_call(state)
