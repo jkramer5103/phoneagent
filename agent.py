@@ -43,6 +43,7 @@ LLM_MODEL = "google/gemini-3-flash-preview"  # Smart LLM for text generation
 CARTESIA_VOICE_ID = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"  # Nico - Friendly Agent (German)
 
 HANGUP_TOKEN = "[HANGUP]"
+INTERRUPT_GRACE_PERIOD = 3.0  # Seconds after agent starts speaking before interruption is allowed
 
 # --- API Models ---
 class CallRequest(BaseModel):
@@ -69,6 +70,7 @@ class AgentState:
         self.silence_start = None
         self.user_speaking = False
         self.speaking_ended_at = 0.0
+        self.speaking_started_at = 0.0
         self.llm_busy = False
         self.hangup_requested = False
         self.sip_sock = None
@@ -504,6 +506,7 @@ def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio, state, rtp_sta
     CHUNK_SIZE = 160
 
     state.is_speaking = True
+    state.speaking_started_at = time.time()
     state.interrupt_flag = False
 
     for i in range(0, len(ulaw_audio), CHUNK_SIZE):
@@ -579,7 +582,9 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
         in_echo_zone = state.is_speaking or (time.time() - state.speaking_ended_at < ECHO_COOLDOWN)
 
         # Allow interruption even during echo zone if audio is very loud
-        if rms > INTERRUPT_THRESHOLD and state.is_speaking:
+        # But not during the grace period at the start of speech
+        in_grace_period = state.is_speaking and (time.time() - state.speaking_started_at < INTERRUPT_GRACE_PERIOD)
+        if rms > INTERRUPT_THRESHOLD and state.is_speaking and not in_grace_period:
             print(f"[VAD] User interrupted AI! (rms={rms})")
             state.interrupt_flag = True
             state.user_speaking = True
@@ -617,6 +622,7 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
 def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, cartesia_ws):
     """Stream Gemini text → Cartesia continuations → RTP audio, all concurrently."""
     if not user_text.strip():
+        state.llm_busy = False
         return
 
     state.llm_busy = True
@@ -632,15 +638,20 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
     tts_ctx = cartesia_ws.context()
 
     # --- Thread 1: Receive audio from Cartesia and push to queue ---
+    audio_chunk_count = 0
+
     def audio_receiver():
+        nonlocal audio_chunk_count
         try:
             for output in tts_ctx.receive():
                 if state.interrupt_flag or not state.call_active:
                     break
                 if hasattr(output, 'audio') and output.audio:
+                    audio_chunk_count += 1
                     audio_q.put(output.audio)
         except Exception as e:
             print(f"[TTS] Receive error: {e}")
+        print(f"[TTS] Audio receiver done — {audio_chunk_count} chunks received")
         audio_q.put(None)  # Sentinel: no more audio
 
     recv_thread = threading.Thread(target=audio_receiver, daemon=True)
@@ -648,41 +659,68 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
 
     # --- Thread 2: Send RTP packets from audio queue ---
     spoken_duration = 0.0  # Track how much audio was actually sent
+    rtp_done_event = threading.Event()
 
     def rtp_sender():
         nonlocal spoken_duration
-        pcm_buffer = b""
-        CHUNK_SAMPLES = 160  # 20ms at 8kHz
-        CHUNK_BYTES_44K = CHUNK_SAMPLES * 2 * (CARTESIA_SAMPLE_RATE // 8000)  # Proportional input needed
-        ratecv_state = None
+        try:
+            pcm_buffer = b""
+            CHUNK_SAMPLES = 160  # 20ms at 8kHz
+            CHUNK_BYTES_44K = CHUNK_SAMPLES * 2 * (CARTESIA_SAMPLE_RATE // 8000)  # Proportional input needed
+            ratecv_state = None
 
-        while True:
-            try:
-                pcm_chunk = audio_q.get(timeout=5)
-            except queue.Empty:
-                break
-            if pcm_chunk is None:
-                break
-            if state.interrupt_flag or not state.call_active:
-                break
-
-            pcm_buffer += pcm_chunk
-
-            # Process in chunks large enough for clean resampling
-            PROCESS_SIZE = CARTESIA_SAMPLE_RATE * 2 // 10  # ~100ms of 44.1kHz PCM16
-            while len(pcm_buffer) >= PROCESS_SIZE:
+            while True:
+                try:
+                    pcm_chunk = audio_q.get(timeout=5)
+                except queue.Empty:
+                    break
+                if pcm_chunk is None:
+                    break
                 if state.interrupt_flag or not state.call_active:
-                    return
+                    break
 
-                segment = pcm_buffer[:PROCESS_SIZE]
-                pcm_buffer = pcm_buffer[PROCESS_SIZE:]
+                pcm_buffer += pcm_chunk
 
-                pcm8k, ratecv_state = audioop.ratecv(segment, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
+                # Process in chunks large enough for clean resampling
+                PROCESS_SIZE = CARTESIA_SAMPLE_RATE * 2 // 10  # ~100ms of 44.1kHz PCM16
+                while len(pcm_buffer) >= PROCESS_SIZE:
+                    if state.interrupt_flag or not state.call_active:
+                        return
+
+                    segment = pcm_buffer[:PROCESS_SIZE]
+                    pcm_buffer = pcm_buffer[PROCESS_SIZE:]
+
+                    pcm8k, ratecv_state = audioop.ratecv(segment, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
+                    ulaw = audioop.lin2ulaw(pcm8k, 2)
+
+                    if not state.is_speaking:
+                        state.is_speaking = True
+                        state.speaking_started_at = time.time()
+
+                    for j in range(0, len(ulaw), CHUNK_SAMPLES):
+                        if state.interrupt_flag or not state.call_active:
+                            return
+                        pkt = ulaw[j:j + CHUNK_SAMPLES]
+                        if len(pkt) < CHUNK_SAMPLES:
+                            pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
+                        with rtp_state.lock:
+                            rtp_header = struct.pack("!BBHII", 0x80, 0,
+                                                     rtp_state.seq & 0xFFFF,
+                                                     rtp_state.timestamp & 0xFFFFFFFF,
+                                                     rtp_state.ssrc)
+                            rtp_state.seq += 1
+                            rtp_state.timestamp += CHUNK_SAMPLES
+                        try:
+                            rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
+                        except OSError:
+                            return
+                        spoken_duration += 0.02
+                        time.sleep(0.02)
+
+            # Flush remaining buffer
+            if pcm_buffer and not state.interrupt_flag and state.call_active:
+                pcm8k, _ = audioop.ratecv(pcm_buffer, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
                 ulaw = audioop.lin2ulaw(pcm8k, 2)
-
-                if not state.is_speaking:
-                    state.is_speaking = True
-
                 for j in range(0, len(ulaw), CHUNK_SAMPLES):
                     if state.interrupt_flag or not state.call_active:
                         return
@@ -702,30 +740,9 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
                         return
                     spoken_duration += 0.02
                     time.sleep(0.02)
-
-        # Flush remaining buffer
-        if pcm_buffer and not state.interrupt_flag and state.call_active:
-            pcm8k, _ = audioop.ratecv(pcm_buffer, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
-            ulaw = audioop.lin2ulaw(pcm8k, 2)
-            for j in range(0, len(ulaw), CHUNK_SAMPLES):
-                if state.interrupt_flag or not state.call_active:
-                    return
-                pkt = ulaw[j:j + CHUNK_SAMPLES]
-                if len(pkt) < CHUNK_SAMPLES:
-                    pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
-                with rtp_state.lock:
-                    rtp_header = struct.pack("!BBHII", 0x80, 0,
-                                             rtp_state.seq & 0xFFFF,
-                                             rtp_state.timestamp & 0xFFFFFFFF,
-                                             rtp_state.ssrc)
-                    rtp_state.seq += 1
-                    rtp_state.timestamp += CHUNK_SAMPLES
-                try:
-                    rtp_sock.sendto(rtp_header + pkt, (remote_ip, remote_port))
-                except OSError:
-                    return
-                spoken_duration += 0.02
-                time.sleep(0.02)
+        finally:
+            rtp_done_event.set()
+            print(f"[RTP-TX] Finished sending {spoken_duration:.1f}s of audio")
 
     rtp_thread = threading.Thread(target=rtp_sender, daemon=True)
     rtp_thread.start()
@@ -830,6 +847,19 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
     # Wait for audio to finish playing
     recv_thread.join(timeout=15)
     rtp_thread.join(timeout=15)
+    rtp_done_event.wait(timeout=15)  # Ensure rtp_sender truly finished
+    print(f"[RTP-TX] All audio sent ({spoken_duration:.1f}s)")
+
+    # Fallback: if streaming TTS produced no audio, re-synthesize and play
+    if spoken_duration < 0.1 and full_response.replace(HANGUP_TOKEN, '').strip() and not state.interrupt_flag and state.call_active:
+        fallback_text = full_response.replace(HANGUP_TOKEN, '').strip()
+        print(f"[TTS] Streaming produced no audio — falling back to non-streaming for: {fallback_text[:60]}...")
+        try:
+            fallback_audio = cartesia_tts_ulaw(fallback_text, cartesia_ws, None)
+            if fallback_audio:
+                rtp_send_thread(rtp_sock, remote_ip, remote_port, fallback_audio, state, rtp_state)
+        except Exception as e:
+            print(f"[TTS] Fallback error: {e}")
 
     state.is_speaking = False
     state.speaking_ended_at = time.time()
@@ -850,12 +880,18 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
     state.llm_busy = False
 
     if hangup and not state.interrupt_flag:
+        # All RTP packets have been sent (confirmed by rtp_done_event).
+        # Wait briefly for the remote phone's jitter buffer to drain before BYE.
+        time.sleep(0.5)
         print("[AGENT] AI decided to hang up")
         state.hangup_requested = True
         state.call_active = False
         if state.sip_sock and state.sip_call_info:
-            local_ip, call_id, tag, cseq, to_header = state.sip_call_info
-            sip_bye(state.sip_sock, local_ip, call_id, tag, cseq, to_header, state.call_number)
+            try:
+                local_ip, call_id, tag, cseq, to_header = state.sip_call_info
+                sip_bye(state.sip_sock, local_ip, call_id, tag, cseq, to_header, state.call_number)
+            except OSError:
+                pass  # Socket already closed by run_call cleanup
 
 
 def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port, state, rtp_state, cartesia_ws):
@@ -869,12 +905,16 @@ def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port, state, rtp_s
             msg = soniox_ws.recv(timeout=0.2)
         except TimeoutError:
             # Check if we have accumulated text and silence has passed
-            if final_text.strip() and not state.user_speaking and not state.llm_busy:
+            if final_text.strip() and not state.user_speaking:
                 elapsed = time.time() - last_final_time
                 if elapsed > 1.5:
+                    if state.llm_busy or state.is_speaking:
+                        # LLM/TTS still running — keep text buffered, retry next cycle
+                        continue
                     # User stopped speaking, process the text
                     text = final_text.strip()
                     final_text = ""
+                    state.llm_busy = True  # Set BEFORE spawning to prevent races
                     # Run LLM in a separate thread so STT keeps processing
                     threading.Thread(target=llm_respond,
                                      args=(text, rtp_sock, remote_ip, remote_port,
@@ -1167,6 +1207,12 @@ def run_call(call_number: str, objective: str) -> CallResult:
 
         # Wait for call to end
         while state.call_active:
+            time.sleep(0.5)
+
+        # Wait for any in-flight LLM/TTS thread to finish before closing sockets
+        for _ in range(20):  # Up to 10s
+            if not state.llm_busy:
+                break
             time.sleep(0.5)
 
         # Cleanup
