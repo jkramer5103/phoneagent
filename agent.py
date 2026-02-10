@@ -43,7 +43,11 @@ SYSTEM_PROMPT = (
     "Du bist ein freundlicher KI-Sprachassistent am Telefon. "
     "Halte deine Antworten kurz und gesprächig — normalerweise 1-3 Sätze. "
     "Du sprichst Deutsch. "
-    "Sei hilfsbereit, natürlich und sympathisch."
+    "Sei hilfsbereit, natürlich und sympathisch. "
+    "Wenn das Gespräch zu Ende ist — zum Beispiel wenn der Nutzer sich verabschiedet, "
+    "\"Tschüss\" sagt, oder darum bittet aufzulegen — dann verabschiede dich kurz und "
+    "füge am Ende deiner Antwort das Token [HANGUP] hinzu. "
+    "Beispiel: 'Alles klar, tschüss und einen schönen Tag noch! [HANGUP]'"
 )
 
 # --- Shared State ---
@@ -59,6 +63,9 @@ class AgentState:
         self.user_speaking = False        # True when user is currently speaking
         self.speaking_ended_at = 0.0      # Timestamp when AI stopped speaking (echo cooldown)
         self.llm_busy = False             # True while LLM is generating a response
+        self.hangup_requested = False     # True when AI decides to hang up
+        self.sip_sock = None              # SIP socket (set during call setup)
+        self.sip_call_info = None         # (local_ip, call_id, tag, cseq, to_header)
 
 state = AgentState()
 
@@ -606,6 +613,8 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + state.conversation[-20:]
 
     full_response = ""
+    tts_buffer = ""           # Buffer to catch [HANGUP] split across chunks
+    HANGUP_TOKEN = "[HANGUP]"
     audio_q = queue.Queue()  # PCM audio chunks from Cartesia → RTP sender
     tts_ctx = cartesia_ws.context()
 
@@ -739,24 +748,65 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
                         content = delta.get("content", "")
                         if content:
                             full_response += content
-                            # Stream each token directly to Cartesia
-                            try:
-                                tts_ctx.send(
-                                    model_id="sonic-3",
-                                    transcript=content,
-                                    voice={"mode": "id", "id": CARTESIA_VOICE_ID},
-                                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
-                                    language="de",
-                                    continue_=True,
-                                )
-                            except Exception as e:
-                                print(f"[TTS] Send error: {e}")
+                            tts_buffer += content
+
+                            # Check if [HANGUP] is fully present
+                            if HANGUP_TOKEN in tts_buffer:
+                                # Send everything before the token
+                                before = tts_buffer.split(HANGUP_TOKEN)[0]
+                                if before.strip():
+                                    try:
+                                        tts_ctx.send(
+                                            model_id="sonic-3",
+                                            transcript=before,
+                                            voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+                                            output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+                                            language="de",
+                                            continue_=True,
+                                        )
+                                    except Exception as e:
+                                        print(f"[TTS] Send error: {e}")
+                                tts_buffer = ""
                                 break
+
+                            # Hold back enough chars to catch a partial "[HANGUP"
+                            safe_len = len(tts_buffer) - len(HANGUP_TOKEN) + 1
+                            if safe_len > 0:
+                                to_send = tts_buffer[:safe_len]
+                                tts_buffer = tts_buffer[safe_len:]
+                                try:
+                                    tts_ctx.send(
+                                        model_id="sonic-3",
+                                        transcript=to_send,
+                                        voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+                                        output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+                                        language="de",
+                                        continue_=True,
+                                    )
+                                except Exception as e:
+                                    print(f"[TTS] Send error: {e}")
+                                    break
                     except (json.JSONDecodeError, IndexError, KeyError):
                         continue
 
     except Exception as e:
         print(f"[LLM] Error: {e}")
+
+    # Flush any remaining buffered text to TTS (strip [HANGUP] if present)
+    if tts_buffer:
+        flush_text = tts_buffer.replace(HANGUP_TOKEN, "").strip()
+        if flush_text:
+            try:
+                tts_ctx.send(
+                    model_id="sonic-3",
+                    transcript=flush_text,
+                    voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+                    language="de",
+                    continue_=True,
+                )
+            except Exception as e:
+                print(f"[TTS] Flush error: {e}")
 
     # Signal Cartesia that no more text is coming
     try:
@@ -771,16 +821,28 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
     state.is_speaking = False
     state.speaking_ended_at = time.time()
 
+    # Check if AI wants to hang up
+    hangup = "[HANGUP]" in full_response
+    clean_response = full_response.replace("[HANGUP]", "").strip()
+
     # Record conversation history
-    if full_response.strip():
+    if clean_response:
         if state.interrupt_flag:
-            state.conversation.append({"role": "assistant", "content": f"{full_response.strip()} [user interrupted]"})
-            print(f"[LLM] Interrupted. Response was: {full_response.strip()}")
+            state.conversation.append({"role": "assistant", "content": f"{clean_response} [user interrupted]"})
+            print(f"[LLM] Interrupted. Response was: {clean_response}")
         else:
-            state.conversation.append({"role": "assistant", "content": full_response.strip()})
-            print(f"[LLM] Response: {full_response.strip()}")
+            state.conversation.append({"role": "assistant", "content": clean_response})
+            print(f"[LLM] Response: {clean_response}")
 
     state.llm_busy = False
+
+    if hangup and not state.interrupt_flag:
+        print("[AGENT] AI decided to hang up")
+        state.hangup_requested = True
+        state.call_active = False
+        if state.sip_sock and state.sip_call_info:
+            local_ip, call_id, tag, cseq, to_header = state.sip_call_info
+            sip_bye(state.sip_sock, local_ip, call_id, tag, cseq, to_header)
 
 
 def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port):
@@ -932,6 +994,8 @@ def main():
             return
 
         call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header = result
+        state.sip_sock = sip_sock
+        state.sip_call_info = (local_ip, call_id, tag, cseq, to_header)
         print("[*] Call established! Starting AI agent...")
 
         # Step 3: Connect to Soniox STT WebSocket
@@ -1015,7 +1079,8 @@ def main():
         except Exception:
             pass
 
-        sip_bye(sip_sock, local_ip, call_id, tag, cseq, to_header)
+        if not state.hangup_requested:
+            sip_bye(sip_sock, local_ip, call_id, tag, cseq, to_header)
 
         for t in threads:
             t.join(timeout=3)
