@@ -262,6 +262,23 @@ def parse_sip_response(data):
             headers[key.strip()] = val.strip()
     return status_code, headers, body, status_line
 
+def parse_sip_request(data):
+    """Parse an incoming SIP request (INVITE, BYE, ACK, etc.)."""
+    text = data.decode(errors="replace")
+    parts = text.split("\r\n\r\n", 1)
+    header_section = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
+    lines = header_section.split("\r\n")
+    request_line = lines[0]
+    method = request_line.split(" ", 1)[0]
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            key, val = line.split(":", 1)
+            headers[key.strip()] = val.strip()
+    return method, headers, body, request_line
+
+
 def sip_send_recv(sock, msg, server, port, timeout=5):
     sock.sendto(msg.encode(), (server, port))
     sock.settimeout(timeout)
@@ -1370,6 +1387,344 @@ def run_call(call_number: str, objective: str) -> CallResult:
 
 
 # ============================================================
+# Incoming Call Handling
+# ============================================================
+
+INCOMING_MESSAGE = (
+    "Diese Rufnummer gehört dem KI-Agenten von Jaron Kramer, "
+    "und sie ist bisher nicht programmiert, eingehende Anrufe anzunehmen."
+)
+
+
+def handle_incoming_call(sip_sock, local_ip, invite_data, addr):
+    """Answer an incoming SIP INVITE, play a message, then hang up."""
+    method, headers, body, request_line = parse_sip_request(invite_data)
+
+    via = ""
+    from_h = ""
+    to_h = ""
+    cid = ""
+    cseq = ""
+    text = invite_data.decode(errors="replace")
+    for line in text.split("\r\n"):
+        if line.startswith("Via:") and not via:
+            via = line
+        elif line.startswith("From:"):
+            from_h = line
+        elif line.startswith("To:"):
+            to_h = line
+        elif line.startswith("Call-ID:"):
+            cid = line
+        elif line.startswith("CSeq:"):
+            cseq = line
+
+    call_id = headers.get("Call-ID", "")
+    contact = headers.get("Contact", "")
+
+    # Add our tag to the To header
+    our_tag = gen_tag()
+    if ";tag=" not in to_h:
+        to_h = to_h + f";tag={our_tag}"
+
+    # Parse remote SDP for RTP info
+    remote_rtp_ip = None
+    remote_rtp_port = None
+    sdp_lines = body.replace("\r\n", "\n").split("\n")
+    for line in sdp_lines:
+        if line.startswith("c=IN IP4 "):
+            remote_rtp_ip = line.split()[-1].strip()
+        if line.startswith("m=audio "):
+            remote_rtp_port = int(line.split()[1])
+
+    # Send 100 Trying
+    trying_msg = (
+        f"SIP/2.0 100 Trying\r\n"
+        f"{via}\r\n"
+        f"{from_h}\r\n"
+        f"{to_h}\r\n"
+        f"{cid}\r\n"
+        f"{cseq}\r\n"
+        f"Content-Length: 0\r\n\r\n"
+    )
+    sip_sock.sendto(trying_msg.encode(), addr)
+    print(f"[SIP-IN] Sent 100 Trying")
+
+    # Send 180 Ringing
+    ringing_msg = (
+        f"SIP/2.0 180 Ringing\r\n"
+        f"{via}\r\n"
+        f"{from_h}\r\n"
+        f"{to_h}\r\n"
+        f"{cid}\r\n"
+        f"{cseq}\r\n"
+        f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{LOCAL_SIP_PORT}>\r\n"
+        f"Content-Length: 0\r\n\r\n"
+    )
+    sip_sock.sendto(ringing_msg.encode(), addr)
+    print(f"[SIP-IN] Sent 180 Ringing")
+
+    # Pre-synthesize the message BEFORE answering (caller hears ringing meanwhile)
+    print("[SIP-IN] Pre-synthesizing message...")
+    cartesia_client = Cartesia(api_key=CARTESIA_API_KEY)
+    tts_ws = cartesia_client.tts.websocket()
+    ulaw_audio = cartesia_tts_ulaw(INCOMING_MESSAGE, tts_ws, cartesia_client)
+    try:
+        tts_ws.close()
+    except Exception:
+        pass
+
+    if not ulaw_audio:
+        print("[SIP-IN] TTS failed, no audio to play")
+        return
+
+    print(f"[SIP-IN] Message ready ({len(ulaw_audio)} bytes), answering call...")
+
+    if not remote_rtp_ip or not remote_rtp_port:
+        print("[SIP-IN] No remote RTP info in SDP, cannot send audio")
+        return
+
+    # Build our SDP answer
+    rtp_port_in = RTP_PORT + 2  # Use a different RTP port for incoming calls
+    sess_id = str(random.randint(1000000, 9999999))
+    sdp_body = (
+        f"v=0\r\n"
+        f"o=VoIPAgent {sess_id} {sess_id} IN IP4 {local_ip}\r\n"
+        f"s=VoIPAgent\r\n"
+        f"c=IN IP4 {local_ip}\r\n"
+        f"t=0 0\r\n"
+        f"m=audio {rtp_port_in} RTP/AVP 0 101\r\n"
+        f"a=rtpmap:0 PCMU/8000\r\n"
+        f"a=rtpmap:101 telephone-event/8000\r\n"
+        f"a=fmtp:101 0-15\r\n"
+        f"a=ptime:20\r\n"
+        f"a=sendrecv\r\n"
+    )
+
+    # Send 200 OK with SDP — answer the call now that audio is ready
+    ok_msg = (
+        f"SIP/2.0 200 OK\r\n"
+        f"{via}\r\n"
+        f"{from_h}\r\n"
+        f"{to_h}\r\n"
+        f"{cid}\r\n"
+        f"{cseq}\r\n"
+        f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{LOCAL_SIP_PORT}>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"User-Agent: VoIPAgent/1.0\r\n"
+        f"Content-Length: {len(sdp_body)}\r\n\r\n"
+        f"{sdp_body}"
+    )
+    sip_sock.sendto(ok_msg.encode(), addr)
+    print(f"[SIP-IN] Sent 200 OK — call answered")
+
+    # Wait for ACK (with timeout)
+    sip_sock.settimeout(5)
+    try:
+        while True:
+            ack_data, ack_addr = sip_sock.recvfrom(8192)
+            ack_text = ack_data.decode(errors="replace")
+            if ack_text.startswith("ACK "):
+                print("[SIP-IN] Received ACK")
+                break
+    except socket.timeout:
+        print("[SIP-IN] No ACK received, proceeding anyway")
+
+    print(f"[SIP-IN] Remote RTP: {remote_rtp_ip}:{remote_rtp_port}")
+
+    # Open RTP socket for this incoming call
+    rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    rtp_sock.bind((local_ip, rtp_port_in))
+
+    try:
+        print(f"[SIP-IN] Playing message ({len(ulaw_audio)} bytes)...")
+
+        # Send audio over RTP
+        rtp_state = RTPState()
+        CHUNK_SIZE = 160
+        for i in range(0, len(ulaw_audio), CHUNK_SIZE):
+            chunk = ulaw_audio[i:i + CHUNK_SIZE]
+            if len(chunk) < CHUNK_SIZE:
+                chunk += b'\xff' * (CHUNK_SIZE - len(chunk))
+            with rtp_state.lock:
+                marker = 0x80 if i == 0 else 0x00
+                rtp_header = struct.pack("!BBHII", 0x80, 0 | marker,
+                                         rtp_state.seq & 0xFFFF,
+                                         rtp_state.timestamp & 0xFFFFFFFF,
+                                         rtp_state.ssrc)
+                rtp_state.seq += 1
+                rtp_state.timestamp += CHUNK_SIZE
+            try:
+                rtp_sock.sendto(rtp_header + chunk, (remote_rtp_ip, remote_rtp_port))
+            except OSError:
+                break
+            time.sleep(0.02)
+
+        print("[SIP-IN] Message played, hanging up")
+        time.sleep(0.5)  # Let jitter buffer drain
+
+    finally:
+        rtp_sock.close()
+
+    # Send BYE
+    cseq_num = 1
+    branch = gen_branch()
+    # Extract the remote URI from the From header for the BYE Request-URI
+    remote_uri = ""
+    from_val = headers.get("From", "")
+    uri_match = re.search(r'<(sip:[^>]+)>', from_val)
+    if uri_match:
+        remote_uri = uri_match.group(1)
+    else:
+        remote_uri = f"sip:{SIP_SERVER}"
+
+    bye_msg = (
+        f"BYE {remote_uri} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={branch};rport\r\n"
+        f"{to_h.replace('To:', 'From:')}\r\n"
+        f"{from_h.replace('From:', 'To:')}\r\n"
+        f"{cid}\r\n"
+        f"CSeq: {cseq_num} BYE\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"Content-Length: 0\r\n\r\n"
+    )
+    sip_sock.sendto(bye_msg.encode(), addr)
+    print("[SIP-IN] Sent BYE")
+
+    # Wait for 200 OK to BYE
+    sip_sock.settimeout(3)
+    try:
+        resp_data, _ = sip_sock.recvfrom(8192)
+        status, _, _, sl = parse_sip_response(resp_data)
+        print(f"[SIP-IN] BYE response: {sl}")
+    except (socket.timeout, Exception):
+        pass
+
+    print("[SIP-IN] Incoming call handled")
+
+
+def incoming_call_listener(sip_sock, local_ip):
+    """Background loop: listen for incoming SIP INVITE and handle them."""
+    print("[SIP-IN] Listening for incoming calls...")
+    sip_sock.settimeout(1)
+    while True:
+        try:
+            data, addr = sip_sock.recvfrom(8192)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        text = data.decode(errors="replace")
+        if text.startswith("INVITE "):
+            print(f"[SIP-IN] Incoming INVITE from {addr}")
+            # Handle in a thread so the listener stays responsive
+            threading.Thread(
+                target=handle_incoming_call,
+                args=(sip_sock, local_ip, data, addr),
+                daemon=True,
+            ).start()
+
+    print("[SIP-IN] Listener stopped")
+
+
+# Global incoming-call socket and thread
+_incoming_sip_sock = None
+_incoming_listener_thread = None
+
+
+def start_incoming_listener():
+    """Register with the SIP server and start listening for incoming calls."""
+    global _incoming_sip_sock, _incoming_listener_thread
+
+    local_ip = get_local_ip()
+    print(f"[SIP-IN] Local IP: {local_ip}")
+
+    # Use a separate socket so it doesn't conflict with outgoing calls
+    sip_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sip_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sip_sock.bind((local_ip, LOCAL_SIP_PORT + 1))
+
+    # Register on this socket so the SIP server knows where to route incoming calls
+    # We temporarily override the port for registration
+    reg_port = LOCAL_SIP_PORT + 1
+    tag = gen_tag()
+    call_id = gen_call_id(local_ip)
+    branch = gen_branch()
+
+    msg = (
+        f"REGISTER sip:{SIP_SERVER} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {local_ip}:{reg_port};branch={branch};rport\r\n"
+        f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
+        f"To: <sip:{SIP_URI_USER}@{SIP_SERVER}>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 REGISTER\r\n"
+        f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{reg_port};transport=udp>\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"Expires: 300\r\n"
+        f"User-Agent: VoIPAgent/1.0\r\n"
+        f"Content-Length: 0\r\n\r\n"
+    )
+
+    print("[SIP-IN] Sending REGISTER for incoming calls...")
+    resp = sip_send_recv(sip_sock, msg, SIP_SERVER, SIP_PORT)
+    if resp is None:
+        print("[SIP-IN] No response to REGISTER")
+        return
+
+    status, headers, body, status_line = parse_sip_response(resp)
+    print(f"[SIP-IN] {status_line}")
+
+    if status == 401:
+        www_auth = headers.get("WWW-Authenticate", "")
+        auth_params = parse_www_authenticate(www_auth)
+        realm = auth_params.get("realm", SIP_SERVER)
+        nonce = auth_params.get("nonce", "")
+        qop = auth_params.get("qop", None)
+        algorithm = auth_params.get("algorithm", "MD5")
+
+        reg_uri = f"sip:{SIP_SERVER}"
+        auth_header = build_auth_header(AUTH_USER, AUTH_PASS, realm, nonce, "REGISTER", reg_uri, qop, algorithm)
+
+        branch = gen_branch()
+        msg = (
+            f"REGISTER sip:{SIP_SERVER} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {local_ip}:{reg_port};branch={branch};rport\r\n"
+            f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
+            f"To: <sip:{SIP_URI_USER}@{SIP_SERVER}>\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: 2 REGISTER\r\n"
+            f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{reg_port};transport=udp>\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Expires: 300\r\n"
+            f"Authorization: {auth_header}\r\n"
+            f"User-Agent: VoIPAgent/1.0\r\n"
+            f"Content-Length: 0\r\n\r\n"
+        )
+
+        print("[SIP-IN] Sending authenticated REGISTER...")
+        resp = sip_send_recv(sip_sock, msg, SIP_SERVER, SIP_PORT)
+        if resp:
+            status, headers, body, status_line = parse_sip_response(resp)
+            print(f"[SIP-IN] {status_line}")
+
+    if status == 200:
+        print("[SIP-IN] Registered for incoming calls!")
+    else:
+        print(f"[SIP-IN] Registration failed: {status}")
+        sip_sock.close()
+        return
+
+    _incoming_sip_sock = sip_sock
+    _incoming_listener_thread = threading.Thread(
+        target=incoming_call_listener,
+        args=(sip_sock, local_ip),
+        daemon=True,
+    )
+    _incoming_listener_thread.start()
+
+
+# ============================================================
 # FastAPI App
 # ============================================================
 
@@ -1394,6 +1749,12 @@ async def make_call(req: CallRequest):
         return result
     finally:
         call_lock.release()
+
+
+@app.on_event("startup")
+async def on_startup():
+    """Start the incoming call listener when the server starts."""
+    threading.Thread(target=start_incoming_listener, daemon=True).start()
 
 
 if __name__ == "__main__":
