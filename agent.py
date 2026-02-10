@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-AI Voice Agent: Calls a phone number via SIP/RTP, transcribes speech with
-Soniox real-time STT, generates responses with Gemini via OpenRouter,
-and speaks them back using Cartesia Sonic TTS. Supports interruption.
+AI Voice Agent REST API: POST /call with a phone number and objective.
+Calls the number via SIP/RTP, transcribes speech with Soniox real-time STT,
+generates responses with Gemini via OpenRouter, speaks them back using
+Cartesia Sonic TTS. Returns a structured summary when the call ends.
 """
 
 import os
@@ -16,9 +17,12 @@ import random
 import audioop
 import queue
 import threading
+import asyncio
 import httpx
 from cartesia import Cartesia
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from websockets.sync.client import connect as ws_connect
 
 load_dotenv()
@@ -29,7 +33,6 @@ SIP_PORT = 5060
 SIP_URI_USER = "**71"
 AUTH_USER = "nutzer-1@speedport.ip"
 AUTH_PASS = "B-fx3$h-7yH4&42"
-CALL_NUMBER = "+4915123412098"
 LOCAL_SIP_PORT = 5060
 RTP_PORT = 16384
 
@@ -39,35 +42,59 @@ CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
 LLM_MODEL = "google/gemini-3-flash-preview"  # Smart LLM for text generation
 CARTESIA_VOICE_ID = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"  # Nico - Friendly Agent (German)
 
-SYSTEM_PROMPT = (
-    "Du bist ein freundlicher KI-Sprachassistent am Telefon. "
-    "Halte deine Antworten kurz und gesprächig — normalerweise 1-3 Sätze. "
-    "Du sprichst Deutsch. "
-    "Sei hilfsbereit, natürlich und sympathisch. "
-    "Wenn das Gespräch zu Ende ist — zum Beispiel wenn der Nutzer sich verabschiedet, "
-    "\"Tschüss\" sagt, oder darum bittet aufzulegen — dann verabschiede dich kurz und "
-    "füge am Ende deiner Antwort das Token [HANGUP] hinzu. "
-    "Beispiel: 'Alles klar, tschüss und einen schönen Tag noch! [HANGUP]'"
-)
+HANGUP_TOKEN = "[HANGUP]"
 
-# --- Shared State ---
+# --- API Models ---
+class CallRequest(BaseModel):
+    number: str
+    objective: str
+
+class CallResult(BaseModel):
+    status: str
+    summary: str
+    objective_completed: bool
+    transcript: list[dict]
+
+# --- Per-call State ---
 class AgentState:
-    def __init__(self):
-        self.is_speaking = False          # True while AI audio is being sent
-        self.interrupt_flag = False       # Set to True when user interrupts
-        self.call_active = True           # False when call ends
-        self.conversation = []            # Chat history for Gemini
+    def __init__(self, call_number: str, objective: str):
+        self.call_number = call_number
+        self.objective = objective
+        self.is_speaking = False
+        self.interrupt_flag = False
+        self.call_active = True
+        self.conversation = []
         self.lock = threading.Lock()
-        self.pending_text = ""            # Accumulated STT text before sending to LLM
-        self.silence_start = None         # When silence started (for endpoint detection)
-        self.user_speaking = False        # True when user is currently speaking
-        self.speaking_ended_at = 0.0      # Timestamp when AI stopped speaking (echo cooldown)
-        self.llm_busy = False             # True while LLM is generating a response
-        self.hangup_requested = False     # True when AI decides to hang up
-        self.sip_sock = None              # SIP socket (set during call setup)
-        self.sip_call_info = None         # (local_ip, call_id, tag, cseq, to_header)
+        self.pending_text = ""
+        self.silence_start = None
+        self.user_speaking = False
+        self.speaking_ended_at = 0.0
+        self.llm_busy = False
+        self.hangup_requested = False
+        self.sip_sock = None
+        self.sip_call_info = None
+        self.system_prompt = self._build_system_prompt()
 
-state = AgentState()
+    def _build_system_prompt(self):
+        return (
+            "Du bist ein KI-Telefonassistent von Jaron Kramer. "
+            "Du rufst im Auftrag von Jaron an. "
+            "Stell dich als KI-Assistent von Jaron Kramer vor, wenn es passt.\n\n"
+            f"Dein Auftrag für diesen Anruf: {self.objective}\n\n"
+            "Regeln:\n"
+            "- Halte deine Antworten kurz und natürlich — normalerweise 1-2 Sätze.\n"
+            "- Du sprichst Deutsch.\n"
+            "- Sei höflich, direkt und zielgerichtet.\n"
+            "- DU bist der Anrufer. DU führst das Gespräch und sagst, was du brauchst. "
+            "Warte nicht darauf, dass der andere fragt — sag direkt, worum es geht.\n"
+            "- Reagiere natürlich auf Rückfragen und arbeite auf dein Ziel hin.\n"
+            "- Wenn dein Anliegen erledigt ist oder das Gespräch zu Ende ist, "
+            "verabschiede dich kurz und füge am Ende das Token [HANGUP] hinzu.\n"
+            "- Beispiel: 'Alles klar, vielen Dank! Tschüss! [HANGUP]'"
+        )
+
+# Lock to prevent concurrent calls (single SIP port)
+call_lock = threading.Lock()
 
 
 # ============================================================
@@ -246,7 +273,7 @@ def sip_register(sock, local_ip):
     return False
 
 
-def sip_invite(sock, local_ip):
+def sip_invite(sock, local_ip, call_number):
     tag = gen_tag()
     call_id = gen_call_id(local_ip)
     branch = gen_branch()
@@ -267,10 +294,10 @@ def sip_invite(sock, local_ip):
     )
 
     msg = (
-        f"INVITE sip:{CALL_NUMBER}@{SIP_SERVER} SIP/2.0\r\n"
+        f"INVITE sip:{call_number}@{SIP_SERVER} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={branch};rport\r\n"
         f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
-        f"To: <sip:{CALL_NUMBER}@{SIP_SERVER}>\r\n"
+        f"To: <sip:{call_number}@{SIP_SERVER}>\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: 1 INVITE\r\n"
         f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{LOCAL_SIP_PORT}>\r\n"
@@ -281,7 +308,7 @@ def sip_invite(sock, local_ip):
         f"{sdp_body}"
     )
 
-    print(f"[SIP] INVITE {CALL_NUMBER}...")
+    print(f"[SIP] INVITE {call_number}...")
     resp = sip_send_recv(sock, msg, SIP_SERVER, SIP_PORT, timeout=5)
     if resp is None:
         print("[SIP] No response to INVITE")
@@ -300,15 +327,15 @@ def sip_invite(sock, local_ip):
         qop = auth_params.get("qop", None)
         algorithm = auth_params.get("algorithm", "MD5")
 
-        invite_uri = f"sip:{CALL_NUMBER}@{SIP_SERVER}"
+        invite_uri = f"sip:{call_number}@{SIP_SERVER}"
         auth_header = build_auth_header(AUTH_USER, AUTH_PASS, realm, nonce, "INVITE", invite_uri, qop, algorithm)
         auth_line_name = "Proxy-Authorization" if status == 407 else "Authorization"
 
         ack_msg = (
-            f"ACK sip:{CALL_NUMBER}@{SIP_SERVER} SIP/2.0\r\n"
+            f"ACK sip:{call_number}@{SIP_SERVER} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={branch};rport\r\n"
             f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
-            f"To: {headers.get('To', f'<sip:{CALL_NUMBER}@{SIP_SERVER}>')}\r\n"
+            f"To: {headers.get('To', f'<sip:{call_number}@{SIP_SERVER}>')}\r\n"
             f"Call-ID: {call_id}\r\n"
             f"CSeq: 1 ACK\r\n"
             f"Max-Forwards: 70\r\n"
@@ -319,10 +346,10 @@ def sip_invite(sock, local_ip):
         branch = gen_branch()
         cseq = 2
         msg = (
-            f"INVITE sip:{CALL_NUMBER}@{SIP_SERVER} SIP/2.0\r\n"
+            f"INVITE sip:{call_number}@{SIP_SERVER} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={branch};rport\r\n"
             f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
-            f"To: <sip:{CALL_NUMBER}@{SIP_SERVER}>\r\n"
+            f"To: <sip:{call_number}@{SIP_SERVER}>\r\n"
             f"Call-ID: {call_id}\r\n"
             f"CSeq: {cseq} INVITE\r\n"
             f"Contact: <sip:{SIP_URI_USER}@{local_ip}:{LOCAL_SIP_PORT}>\r\n"
@@ -367,9 +394,9 @@ def sip_invite(sock, local_ip):
 
     print(f"[SIP] Call answered! Remote RTP: {remote_rtp_ip}:{remote_rtp_port}")
 
-    to_header = headers.get("To", f"<sip:{CALL_NUMBER}@{SIP_SERVER}>")
+    to_header = headers.get("To", f"<sip:{call_number}@{SIP_SERVER}>")
     ack_msg = (
-        f"ACK sip:{CALL_NUMBER}@{SIP_SERVER} SIP/2.0\r\n"
+        f"ACK sip:{call_number}@{SIP_SERVER} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={gen_branch()};rport\r\n"
         f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
         f"To: {to_header}\r\n"
@@ -383,10 +410,10 @@ def sip_invite(sock, local_ip):
     return call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header
 
 
-def sip_bye(sock, local_ip, call_id, tag, cseq, to_header):
+def sip_bye(sock, local_ip, call_id, tag, cseq, to_header, call_number):
     branch = gen_branch()
     msg = (
-        f"BYE sip:{CALL_NUMBER}@{SIP_SERVER} SIP/2.0\r\n"
+        f"BYE sip:{call_number}@{SIP_SERVER} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {local_ip}:{LOCAL_SIP_PORT};branch={branch};rport\r\n"
         f"From: <sip:{SIP_URI_USER}@{SIP_SERVER}>;tag={tag}\r\n"
         f"To: {to_header}\r\n"
@@ -406,22 +433,17 @@ def sip_bye(sock, local_ip, call_id, tag, cseq, to_header):
 # TTS: Cartesia Sonic (ultra-low latency streaming neural TTS)
 # ============================================================
 
-# Persistent Cartesia client and WebSocket (initialized in main)
-cartesia_client = None
-cartesia_ws = None
-
 CARTESIA_SAMPLE_RATE = 44100  # Synthesize at high quality, downsample for RTP
 
 
-def cartesia_tts_ulaw(text):
+def cartesia_tts_ulaw(text, tts_ws, tts_client):
     """Convert text to u-law audio via Cartesia Sonic (single shot, for greeting)."""
-    global cartesia_ws
     if not text.strip():
         return b""
 
     pcm_chunks = []
     try:
-        for output in cartesia_ws.send(
+        for output in tts_ws.send(
             model_id="sonic-3",
             transcript=text,
             voice={"mode": "id", "id": CARTESIA_VOICE_ID},
@@ -432,10 +454,6 @@ def cartesia_tts_ulaw(text):
                 pcm_chunks.append(output.audio)
     except Exception as e:
         print(f"[TTS] Cartesia error: {e}")
-        try:
-            cartesia_ws = cartesia_client.tts.websocket()
-        except Exception:
-            pass
         return b""
 
     if not pcm_chunks:
@@ -450,7 +468,6 @@ def cartesia_tts_ulaw(text):
 # RTP Send (with interruption support) + Keepalive
 # ============================================================
 
-# Shared RTP state for keepalive coordination
 class RTPState:
     def __init__(self):
         self.seq = random.randint(0, 0xFFFF)
@@ -458,10 +475,8 @@ class RTPState:
         self.ssrc = random.randint(0, 0xFFFFFFFF)
         self.lock = threading.Lock()
 
-rtp_state = RTPState()
 
-
-def rtp_keepalive_thread(rtp_sock, remote_ip, remote_port):
+def rtp_keepalive_thread(rtp_sock, remote_ip, remote_port, state, rtp_state):
     """Send silence RTP packets to keep the call alive when not speaking."""
     CHUNK_SIZE = 160
     silence = b'\xff' * CHUNK_SIZE  # 0xFF = silence in u-law
@@ -484,7 +499,7 @@ def rtp_keepalive_thread(rtp_sock, remote_ip, remote_port):
     print("[RTP-KA] Keepalive stopped")
 
 
-def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio):
+def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio, state, rtp_state):
     """Send u-law audio over RTP. Stops if interrupted."""
     CHUNK_SIZE = 160
 
@@ -523,7 +538,7 @@ def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio):
 # RTP Receive → Soniox STT
 # ============================================================
 
-def rtp_receive_thread(rtp_sock, soniox_ws):
+def rtp_receive_thread(rtp_sock, soniox_ws, state):
     """Receive RTP audio and forward to Soniox for transcription."""
     print("[RTP-RX] Listening for incoming audio...")
     rtp_sock.settimeout(0.1)
@@ -599,22 +614,20 @@ def rtp_receive_thread(rtp_sock, soniox_ws):
 # Soniox STT → Gemini LLM → Cartesia TTS (streaming) → RTP pipeline
 # ============================================================
 
-def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
+def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, cartesia_ws):
     """Stream Gemini text → Cartesia continuations → RTP audio, all concurrently."""
     if not user_text.strip():
         return
 
-    global cartesia_ws
     state.llm_busy = True
     state.interrupt_flag = False
     print(f"[LLM] User said: {user_text}")
 
     state.conversation.append({"role": "user", "content": user_text})
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + state.conversation[-20:]
+    messages = [{"role": "system", "content": state.system_prompt}] + state.conversation[-20:]
 
     full_response = ""
     tts_buffer = ""           # Buffer to catch [HANGUP] split across chunks
-    HANGUP_TOKEN = "[HANGUP]"
     audio_q = queue.Queue()  # PCM audio chunks from Cartesia → RTP sender
     tts_ctx = cartesia_ws.context()
 
@@ -842,10 +855,10 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port):
         state.call_active = False
         if state.sip_sock and state.sip_call_info:
             local_ip, call_id, tag, cseq, to_header = state.sip_call_info
-            sip_bye(state.sip_sock, local_ip, call_id, tag, cseq, to_header)
+            sip_bye(state.sip_sock, local_ip, call_id, tag, cseq, to_header, state.call_number)
 
 
-def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port):
+def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port, state, rtp_state, cartesia_ws):
     """Read Soniox STT results and trigger LLM responses."""
     print("[STT] Processing thread started")
     final_text = ""
@@ -864,7 +877,8 @@ def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port):
                     final_text = ""
                     # Run LLM in a separate thread so STT keeps processing
                     threading.Thread(target=llm_respond,
-                                     args=(text, rtp_sock, remote_ip, remote_port),
+                                     args=(text, rtp_sock, remote_ip, remote_port,
+                                           state, rtp_state, cartesia_ws),
                                      daemon=True).start()
             continue
         except Exception as e:
@@ -907,7 +921,7 @@ def stt_process_thread(soniox_ws, rtp_sock, remote_ip, remote_port):
 # SIP keepalive & BYE detection
 # ============================================================
 
-def sip_listener_thread(sip_sock, local_ip, call_id, tag, to_header):
+def sip_listener_thread(sip_sock, local_ip, call_id, tag, to_header, state):
     """Listen for BYE from remote end."""
     sip_sock.settimeout(1)
     while state.call_active:
@@ -957,16 +971,71 @@ def sip_listener_thread(sip_sock, local_ip, call_id, tag, to_header):
 
 
 # ============================================================
-# Main
+# Post-call summarization
 # ============================================================
 
-def main():
-    if not OPENROUTER_KEY:
-        print("[!] OPENROUTER_KEY not set in .env")
-        return
-    if not SONIOX_API_KEY:
-        print("[!] SONIOX_API_KEY not set in .env")
-        return
+def summarize_call(state):
+    """Use the LLM to summarize the call and determine if the objective was met."""
+    transcript = state.conversation
+    if not transcript:
+        return "No conversation took place.", False
+
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Du bist ein Analyst. Du bekommst ein Gesprächsprotokoll eines Telefonats "
+                "und den Auftrag, der dem Anrufer gegeben wurde. "
+                "Antworte auf Englisch mit genau diesem JSON-Format (kein Markdown, nur rohes JSON):\n"
+                '{"summary": "...", "objective_completed": true/false}\n\n'
+                "- summary: A concise English summary of what happened in the call (2-4 sentences).\n"
+                "- objective_completed: true if the objective was achieved, false otherwise."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Objective: {state.objective}\n\n"
+                f"Transcript:\n" +
+                "\n".join(f"{m['role'].upper()}: {m['content']}" for m in transcript)
+            ),
+        },
+    ]
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": LLM_MODEL,
+                    "messages": summary_messages,
+                    "max_tokens": 500,
+                },
+            )
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            # Parse JSON from response (strip markdown fences if present)
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(content)
+            return result.get("summary", ""), result.get("objective_completed", False)
+    except Exception as e:
+        print(f"[SUMMARY] Error: {e}")
+        return "Failed to generate summary.", False
+
+
+# ============================================================
+# Core call logic
+# ============================================================
+
+def run_call(call_number: str, objective: str) -> CallResult:
+    """Execute a full phone call and return structured results."""
+    state = AgentState(call_number, objective)
+    rtp_state = RTPState()
 
     local_ip = get_local_ip()
     print(f"[*] Local IP: {local_ip}")
@@ -982,27 +1051,77 @@ def main():
     rtp_sock.bind((local_ip, RTP_PORT))
 
     try:
-        # Step 1: Register
-        if not sip_register(sip_sock, local_ip):
-            print("[!] Registration failed")
-            return
+        # Step 1: Initialize Cartesia TTS early (needed for pre-synthesis)
+        print("[TTS] Connecting to Cartesia Sonic...")
+        cartesia_client = Cartesia(api_key=CARTESIA_API_KEY)
+        cartesia_ws = cartesia_client.tts.websocket()
+        print("[TTS] Cartesia connected")
 
-        # Step 2: Call
-        result = sip_invite(sip_sock, local_ip)
+        # Step 2: Pre-generate opening line + synthesize audio BEFORE calling
+        print("[*] Generating opening line...")
+        opening_messages = [
+            {"role": "system", "content": state.system_prompt},
+            {"role": "user", "content": (
+                "Der Angerufene hat gerade abgenommen. "
+                "Stell dich kurz als KI-Assistent von Jaron Kramer vor "
+                "und sag direkt, warum du anrufst. "
+                "Maximal 2 Sätze. Kein [HANGUP]."
+            )},
+        ]
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": LLM_MODEL, "messages": opening_messages, "max_tokens": 100},
+                )
+                greeting = resp.json()["choices"][0]["message"]["content"].strip()
+                greeting = greeting.replace(HANGUP_TOKEN, "").strip()
+        except Exception as e:
+            print(f"[LLM] Opening line error: {e}")
+            greeting = "Hallo, guten Tag!"
+
+        print(f"[*] Opening: {greeting}")
+        print("[*] Pre-synthesizing greeting audio...")
+        greeting_audio = cartesia_tts_ulaw(greeting, cartesia_ws, cartesia_client)
+        print(f"[*] Greeting audio ready ({len(greeting_audio)} bytes)")
+
+        # Reconnect Cartesia WS — the .send() call above consumed the connection,
+        # we need a fresh one for the streaming .context() API used during the call
+        try:
+            cartesia_ws.close()
+        except Exception:
+            pass
+        cartesia_ws = cartesia_client.tts.websocket()
+        print("[TTS] Cartesia reconnected for streaming")
+
+        # Step 3: Register
+        if not sip_register(sip_sock, local_ip):
+            return CallResult(
+                status="failed", summary="SIP registration failed.",
+                objective_completed=False, transcript=[],
+            )
+
+        # Step 4: Call
+        result = sip_invite(sip_sock, local_ip, call_number)
         if result is None:
-            print("[!] Call setup failed")
-            return
+            return CallResult(
+                status="failed", summary="Call setup failed. No answer or rejected.",
+                objective_completed=False, transcript=[],
+            )
 
         call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header = result
         state.sip_sock = sip_sock
         state.sip_call_info = (local_ip, call_id, tag, cseq, to_header)
         print("[*] Call established! Starting AI agent...")
 
-        # Step 3: Connect to Soniox STT WebSocket
+        # Step 5: Connect Soniox + start all threads BEFORE greeting
         print("[STT] Connecting to Soniox...")
         soniox_ws = ws_connect("wss://stt-rt.soniox.com/transcribe-websocket")
 
-        # Configure Soniox for raw PCM from phone (8kHz, 16-bit, mono after ulaw decode)
         soniox_config = {
             "api_key": SONIOX_API_KEY,
             "model": "stt-rt-preview",
@@ -1015,61 +1134,45 @@ def main():
         soniox_ws.send(json.dumps(soniox_config))
         print("[STT] Soniox connected and configured")
 
-        # Step 4: Start all threads BEFORE greeting so we can hear user immediately after
         threads = []
 
-        # RTP receive → Soniox
-        t_rtp_rx = threading.Thread(target=rtp_receive_thread, args=(rtp_sock, soniox_ws), daemon=True)
+        t_rtp_rx = threading.Thread(target=rtp_receive_thread,
+                                     args=(rtp_sock, soniox_ws, state), daemon=True)
         t_rtp_rx.start()
         threads.append(t_rtp_rx)
 
-        # STT → LLM → TTS → RTP
-        t_stt = threading.Thread(target=stt_process_thread,
-                                 args=(soniox_ws, rtp_sock, remote_rtp_ip, remote_rtp_port), daemon=True)
-        t_stt.start()
-        threads.append(t_stt)
-
-        # RTP keepalive (prevents router from dropping the call)
         t_keepalive = threading.Thread(target=rtp_keepalive_thread,
-                                       args=(rtp_sock, remote_rtp_ip, remote_rtp_port), daemon=True)
+                                       args=(rtp_sock, remote_rtp_ip, remote_rtp_port,
+                                             state, rtp_state), daemon=True)
         t_keepalive.start()
         threads.append(t_keepalive)
 
-        # Initialize Cartesia TTS
-        global cartesia_client, cartesia_ws
-        print("[TTS] Connecting to Cartesia Sonic...")
-        cartesia_client = Cartesia(api_key=CARTESIA_API_KEY)
-        cartesia_ws = cartesia_client.tts.websocket()
-        print("[TTS] Cartesia connected")
+        t_stt = threading.Thread(target=stt_process_thread,
+                                 args=(soniox_ws, rtp_sock, remote_rtp_ip, remote_rtp_port,
+                                       state, rtp_state, cartesia_ws), daemon=True)
+        t_stt.start()
+        threads.append(t_stt)
 
-        # Play greeting
-        print("[*] Playing greeting...")
-        greeting = "Hallo! Ich bin dein KI Assistent. Wie kann ich dir helfen?"
-        greeting_audio = cartesia_tts_ulaw(greeting)
-        rtp_send_thread(rtp_sock, remote_rtp_ip, remote_rtp_port, greeting_audio)
-        state.conversation.append({"role": "assistant", "content": greeting})
-
-        # SIP listener (detect BYE)
         t_sip = threading.Thread(target=sip_listener_thread,
-                                 args=(sip_sock, local_ip, call_id, tag, to_header), daemon=True)
+                                 args=(sip_sock, local_ip, call_id, tag, to_header, state), daemon=True)
         t_sip.start()
         threads.append(t_sip)
 
-        print("[*] AI Agent is live! Press Ctrl+C to end the call.")
+        # Step 6: Play greeting IMMEDIATELY (audio was pre-synthesized, threads already listening)
+        rtp_send_thread(rtp_sock, remote_rtp_ip, remote_rtp_port, greeting_audio, state, rtp_state)
+        state.conversation.append({"role": "assistant", "content": greeting})
+
+        print("[*] AI Agent is live!")
         print("=" * 60)
 
         # Wait for call to end
-        try:
-            while state.call_active:
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            print("\n[*] Ctrl+C — ending call...")
-            state.call_active = False
+        while state.call_active:
+            time.sleep(0.5)
 
         # Cleanup
         print("[*] Shutting down...")
         try:
-            soniox_ws.send(b"")  # Signal end of stream
+            soniox_ws.send(b"")
             time.sleep(0.5)
             soniox_ws.close()
         except Exception:
@@ -1080,7 +1183,7 @@ def main():
             pass
 
         if not state.hangup_requested:
-            sip_bye(sip_sock, local_ip, call_id, tag, cseq, to_header)
+            sip_bye(sip_sock, local_ip, call_id, tag, cseq, to_header, call_number)
 
         for t in threads:
             t.join(timeout=3)
@@ -1089,8 +1192,46 @@ def main():
         rtp_sock.close()
         sip_sock.close()
 
-    print("[*] Done.")
+    print("[*] Call finished. Generating summary...")
+    summary, objective_completed = summarize_call(state)
+    print(f"[*] Summary: {summary}")
+    print(f"[*] Objective completed: {objective_completed}")
+
+    return CallResult(
+        status="completed",
+        summary=summary,
+        objective_completed=objective_completed,
+        transcript=state.conversation,
+    )
+
+
+# ============================================================
+# FastAPI App
+# ============================================================
+
+app = FastAPI(title="AI Voice Agent API")
+
+
+@app.post("/call", response_model=CallResult)
+async def make_call(req: CallRequest):
+    """Place a phone call with a given objective and return the result."""
+    if not OPENROUTER_KEY or not SONIOX_API_KEY or not CARTESIA_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing API keys in .env")
+
+    acquired = call_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(status_code=409, detail="A call is already in progress. Try again later.")
+
+    try:
+        print(f"\n[API] New call request: number={req.number}, objective={req.objective}")
+        # Run the blocking call in a thread so FastAPI stays responsive
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_call, req.number, req.objective)
+        return result
+    finally:
+        call_lock.release()
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
