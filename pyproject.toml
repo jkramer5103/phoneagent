@@ -1,0 +1,15 @@
+[project]
+name = "voip"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "edge-tts>=7.2.7",
+    "gtts>=2.5.4",
+    "httpx>=0.28.1",
+    "miniaudio>=1.61",
+    "python-dotenv>=1.2.1",
+    "pyvoip>=1.6.8",
+    "websockets>=16.0",
+]
