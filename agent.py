@@ -59,12 +59,13 @@ ECHO_COOLDOWN = float(os.getenv("ECHO_COOLDOWN", "0.8"))
 # ============================================================
 
 class CallRecorder:
-    """Records both sides of a call by capturing raw u-law RTP audio with timestamps."""
+    """Records both sides of a call by capturing raw G.711 RTP audio with timestamps."""
 
     def __init__(self):
         self.start_time = None
-        self.inbound = []   # (offset_samples, ulaw_bytes) from remote party
-        self.outbound = []  # (offset_samples, ulaw_bytes) from agent
+        self.codec = "PCMU"  # Set by caller after codec negotiation
+        self.inbound = []   # (offset_samples, g711_bytes) from remote party
+        self.outbound = []  # (offset_samples, g711_bytes) from agent
         self.lock = threading.Lock()
 
     def start(self):
@@ -113,10 +114,10 @@ class CallRecorder:
         pcm_in = bytearray(max_sample * 2)
         pcm_out = bytearray(max_sample * 2)
 
-        # Decode u-law chunks into PCM buffers at their correct offsets
+        # Decode G.711 chunks into PCM buffers at their correct offsets
         for offset, data in inbound:
             try:
-                pcm = audioop.ulaw2lin(data, 2)
+                pcm = g711_to_pcm(data, self.codec)
                 byte_offset = offset * 2
                 end = byte_offset + len(pcm)
                 if end <= len(pcm_in):
@@ -126,7 +127,7 @@ class CallRecorder:
 
         for offset, data in outbound:
             try:
-                pcm = audioop.ulaw2lin(data, 2)
+                pcm = g711_to_pcm(data, self.codec)
                 byte_offset = offset * 2
                 end = byte_offset + len(pcm)
                 if end <= len(pcm_out):
@@ -178,6 +179,7 @@ class AgentState:
         self.hangup_requested = False
         self.sip_sock = None
         self.sip_call_info = None
+        self.codec = "PCMU"  # Negotiated codec: "PCMU" (u-law) or "PCMA" (A-law)
         self.recorder = CallRecorder()
         self.system_prompt = self._build_system_prompt()
 
@@ -396,6 +398,22 @@ def sip_register(sock, local_ip):
     return False
 
 
+def parse_negotiated_codec(sdp_body):
+    """Parse the first audio codec from a remote SDP answer.
+    Returns 'PCMA' if A-law (payload 8) is first, 'PCMU' otherwise."""
+    for line in sdp_body.replace("\r\n", "\n").split("\n"):
+        if line.startswith("m=audio "):
+            # m=audio <port> RTP/AVP <pt1> <pt2> ...
+            parts = line.split()
+            if len(parts) >= 4:
+                first_pt = parts[3]
+                if first_pt == "8":
+                    return "PCMA"
+                elif first_pt == "0":
+                    return "PCMU"
+    return "PCMU"  # Default fallback
+
+
 def sip_invite(sock, local_ip, call_number):
     tag = gen_tag()
     call_id = gen_call_id(local_ip)
@@ -408,7 +426,8 @@ def sip_invite(sock, local_ip, call_number):
         f"s=VoIPAgent\r\n"
         f"c=IN IP4 {local_ip}\r\n"
         f"t=0 0\r\n"
-        f"m=audio {RTP_PORT} RTP/AVP 0 101\r\n"
+        f"m=audio {RTP_PORT} RTP/AVP 8 0 101\r\n"
+        f"a=rtpmap:8 PCMA/8000\r\n"
         f"a=rtpmap:0 PCMU/8000\r\n"
         f"a=rtpmap:101 telephone-event/8000\r\n"
         f"a=fmtp:101 0-15\r\n"
@@ -515,7 +534,8 @@ def sip_invite(sock, local_ip, call_number):
         if line.startswith("m=audio "):
             remote_rtp_port = int(line.split()[1])
 
-    print(f"[SIP] Call answered! Remote RTP: {remote_rtp_ip}:{remote_rtp_port}")
+    codec = parse_negotiated_codec(body)
+    print(f"[SIP] Call answered! Remote RTP: {remote_rtp_ip}:{remote_rtp_port}, codec: {codec}")
 
     to_header = headers.get("To", f"<sip:{call_number}@{SIP_SERVER}>")
     ack_msg = (
@@ -530,7 +550,7 @@ def sip_invite(sock, local_ip, call_number):
     )
     sock.sendto(ack_msg.encode(), (SIP_SERVER, SIP_PORT))
 
-    return call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header
+    return call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header, codec
 
 
 def sip_bye(sock, local_ip, call_id, tag, cseq, to_header, call_number):
@@ -558,8 +578,29 @@ def sip_bye(sock, local_ip, call_id, tag, cseq, to_header, call_number):
 
 
 
-def cartesia_tts_ulaw(text, tts_ws, tts_client):
-    """Convert text to u-law audio via Cartesia Sonic (single shot, for greeting)."""
+def pcm_to_g711(pcm_data, codec="PCMU"):
+    """Encode 16-bit PCM to G.711 (u-law or A-law)."""
+    if codec == "PCMA":
+        return audioop.lin2alaw(pcm_data, 2)
+    return audioop.lin2ulaw(pcm_data, 2)
+
+
+def g711_to_pcm(g711_data, codec="PCMU"):
+    """Decode G.711 (u-law or A-law) to 16-bit PCM."""
+    if codec == "PCMA":
+        return audioop.alaw2lin(g711_data, 2)
+    return audioop.ulaw2lin(g711_data, 2)
+
+
+def g711_silence(codec="PCMU"):
+    """Return the silence byte for the given codec."""
+    if codec == "PCMA":
+        return b'\xd5'  # A-law silence
+    return b'\xff'      # u-law silence
+
+
+def _cartesia_tts_pcm8k(text, tts_ws):
+    """Convert text to 8kHz 16-bit PCM via Cartesia Sonic (no G.711 encoding)."""
     if not text.strip():
         return b""
 
@@ -583,7 +624,35 @@ def cartesia_tts_ulaw(text, tts_ws, tts_client):
 
     pcm = b"".join(pcm_chunks)
     pcm8k, _ = audioop.ratecv(pcm, 2, 1, CARTESIA_SAMPLE_RATE, 8000, None)
-    return audioop.lin2ulaw(pcm8k, 2)
+    return pcm8k
+
+
+def cartesia_tts_g711(text, tts_ws, tts_client, codec="PCMU"):
+    """Convert text to G.711 audio via Cartesia Sonic (single shot, for greeting)."""
+    if not text.strip():
+        return b""
+
+    pcm_chunks = []
+    try:
+        for output in tts_ws.send(
+            model_id="sonic-3",
+            transcript=text,
+            voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+            language="de",
+            output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": CARTESIA_SAMPLE_RATE},
+        ):
+            if hasattr(output, 'audio') and output.audio:
+                pcm_chunks.append(output.audio)
+    except Exception as e:
+        print(f"[TTS] Cartesia error: {e}")
+        return b""
+
+    if not pcm_chunks:
+        return b""
+
+    pcm = b"".join(pcm_chunks)
+    pcm8k, _ = audioop.ratecv(pcm, 2, 1, CARTESIA_SAMPLE_RATE, 8000, None)
+    return pcm_to_g711(pcm8k, codec)
 
 
 # ============================================================
@@ -601,12 +670,13 @@ class RTPState:
 def rtp_keepalive_thread(rtp_sock, remote_ip, remote_port, state, rtp_state):
     """Send silence RTP packets to keep the call alive when not speaking."""
     CHUNK_SIZE = 160
-    silence = b'\xff' * CHUNK_SIZE  # 0xFF = silence in u-law
+    pt = 8 if state.codec == "PCMA" else 0
+    silence = g711_silence(state.codec) * CHUNK_SIZE
 
     while state.call_active:
         if not state.is_speaking:
             with rtp_state.lock:
-                rtp_header = struct.pack("!BBHII", 0x80, 0,
+                rtp_header = struct.pack("!BBHII", 0x80, pt,
                                          rtp_state.seq & 0xFFFF,
                                          rtp_state.timestamp & 0xFFFFFFFF,
                                          rtp_state.ssrc)
@@ -621,26 +691,28 @@ def rtp_keepalive_thread(rtp_sock, remote_ip, remote_port, state, rtp_state):
     print("[RTP-KA] Keepalive stopped")
 
 
-def rtp_send_thread(rtp_sock, remote_ip, remote_port, ulaw_audio, state, rtp_state):
-    """Send u-law audio over RTP. Stops if interrupted."""
+def rtp_send_thread(rtp_sock, remote_ip, remote_port, g711_audio, state, rtp_state):
+    """Send G.711 audio over RTP. Stops if interrupted."""
     CHUNK_SIZE = 160
+    pt = 8 if state.codec == "PCMA" else 0
+    sil = g711_silence(state.codec)
 
     state.is_speaking = True
     state.speaking_started_at = time.time()
     state.interrupt_flag = False
 
-    for i in range(0, len(ulaw_audio), CHUNK_SIZE):
+    for i in range(0, len(g711_audio), CHUNK_SIZE):
         if state.interrupt_flag or not state.call_active:
             print("[RTP-TX] Interrupted!")
             break
 
-        chunk = ulaw_audio[i:i + CHUNK_SIZE]
+        chunk = g711_audio[i:i + CHUNK_SIZE]
         if len(chunk) < CHUNK_SIZE:
-            chunk += b'\xff' * (CHUNK_SIZE - len(chunk))
+            chunk += sil * (CHUNK_SIZE - len(chunk))
 
         with rtp_state.lock:
             marker = 0x80 if i == 0 else 0x00
-            rtp_header = struct.pack("!BBHII", 0x80, 0 | marker,
+            rtp_header = struct.pack("!BBHII", 0x80, pt | marker,
                                      rtp_state.seq & 0xFFFF,
                                      rtp_state.timestamp & 0xFFFFFFFF,
                                      rtp_state.ssrc)
@@ -688,9 +760,9 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
         # Record inbound audio
         state.recorder.record_inbound(payload)
 
-        # Convert u-law to 16-bit PCM for Soniox
+        # Convert G.711 to 16-bit PCM for Soniox
         try:
-            pcm_data = audioop.ulaw2lin(payload, 2)
+            pcm_data = g711_to_pcm(payload, state.codec)
         except audioop.error:
             continue
 
@@ -725,14 +797,13 @@ def rtp_receive_thread(rtp_sock, soniox_ws, state):
                     state.user_speaking = False
                     state.silence_start = None
 
-        # Forward PCM to Soniox — skip during AI speech + echo cooldown
-        # But if user is interrupting, forward anyway so STT captures it
-        if not in_echo_zone or state.interrupt_flag:
-            try:
-                soniox_ws.send(pcm_data)
-            except Exception as e:
-                print(f"[RTP-RX] Soniox send error: {e}")
-                break
+        # Always forward PCM to Soniox so it doesn't time out waiting for audio.
+        # Echo suppression is handled at the VAD/LLM-trigger level, not here.
+        try:
+            soniox_ws.send(pcm_data)
+        except Exception as e:
+            print(f"[RTP-RX] Soniox send error: {e}")
+            break
 
     print("[RTP-RX] Stopped")
 
@@ -813,20 +884,22 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
                     pcm_buffer = pcm_buffer[PROCESS_SIZE:]
 
                     pcm8k, ratecv_state = audioop.ratecv(segment, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
-                    ulaw = audioop.lin2ulaw(pcm8k, 2)
+                    g711 = pcm_to_g711(pcm8k, state.codec)
+                    pt = 8 if state.codec == "PCMA" else 0
+                    sil = g711_silence(state.codec)
 
                     if not state.is_speaking:
                         state.is_speaking = True
                         state.speaking_started_at = time.time()
 
-                    for j in range(0, len(ulaw), CHUNK_SAMPLES):
+                    for j in range(0, len(g711), CHUNK_SAMPLES):
                         if state.interrupt_flag or not state.call_active:
                             return
-                        pkt = ulaw[j:j + CHUNK_SAMPLES]
+                        pkt = g711[j:j + CHUNK_SAMPLES]
                         if len(pkt) < CHUNK_SAMPLES:
-                            pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
+                            pkt += sil * (CHUNK_SAMPLES - len(pkt))
                         with rtp_state.lock:
-                            rtp_header = struct.pack("!BBHII", 0x80, 0,
+                            rtp_header = struct.pack("!BBHII", 0x80, pt,
                                                      rtp_state.seq & 0xFFFF,
                                                      rtp_state.timestamp & 0xFFFFFFFF,
                                                      rtp_state.ssrc)
@@ -843,15 +916,17 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
             # Flush remaining buffer
             if pcm_buffer and not state.interrupt_flag and state.call_active:
                 pcm8k, _ = audioop.ratecv(pcm_buffer, 2, 1, CARTESIA_SAMPLE_RATE, 8000, ratecv_state)
-                ulaw = audioop.lin2ulaw(pcm8k, 2)
-                for j in range(0, len(ulaw), CHUNK_SAMPLES):
+                g711 = pcm_to_g711(pcm8k, state.codec)
+                pt = 8 if state.codec == "PCMA" else 0
+                sil = g711_silence(state.codec)
+                for j in range(0, len(g711), CHUNK_SAMPLES):
                     if state.interrupt_flag or not state.call_active:
                         return
-                    pkt = ulaw[j:j + CHUNK_SAMPLES]
+                    pkt = g711[j:j + CHUNK_SAMPLES]
                     if len(pkt) < CHUNK_SAMPLES:
-                        pkt += b'\xff' * (CHUNK_SAMPLES - len(pkt))
+                        pkt += sil * (CHUNK_SAMPLES - len(pkt))
                     with rtp_state.lock:
-                        rtp_header = struct.pack("!BBHII", 0x80, 0,
+                        rtp_header = struct.pack("!BBHII", 0x80, pt,
                                                  rtp_state.seq & 0xFFFF,
                                                  rtp_state.timestamp & 0xFFFFFFFF,
                                                  rtp_state.ssrc)
@@ -979,7 +1054,7 @@ def llm_respond(user_text, rtp_sock, remote_ip, remote_port, state, rtp_state, c
         fallback_text = full_response.replace(HANGUP_TOKEN, '').strip()
         print(f"[TTS] Streaming produced no audio — falling back to non-streaming for: {fallback_text[:60]}...")
         try:
-            fallback_audio = cartesia_tts_ulaw(fallback_text, cartesia_ws, None)
+            fallback_audio = cartesia_tts_g711(fallback_text, cartesia_ws, None, state.codec)
             if fallback_audio:
                 rtp_send_thread(rtp_sock, remote_ip, remote_port, fallback_audio, state, rtp_state)
         except Exception as e:
@@ -1249,9 +1324,9 @@ def run_call(call_number: str, objective: str) -> CallResult:
             greeting = "Hallo, guten Tag!"
 
         print(f"[*] Opening: {greeting}")
-        print("[*] Pre-synthesizing greeting audio...")
-        greeting_audio = cartesia_tts_ulaw(greeting, cartesia_ws, cartesia_client)
-        print(f"[*] Greeting audio ready ({len(greeting_audio)} bytes)")
+        print("[*] Pre-synthesizing greeting audio (PCM)...")
+        greeting_pcm = _cartesia_tts_pcm8k(greeting, cartesia_ws)
+        print(f"[*] Greeting PCM ready ({len(greeting_pcm)} bytes)")
 
         # Reconnect Cartesia WS — the .send() call above consumed the connection,
         # we need a fresh one for the streaming .context() API used during the call
@@ -1277,10 +1352,17 @@ def run_call(call_number: str, objective: str) -> CallResult:
                 objective_completed=False, transcript=[],
             )
 
-        call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header = result
+        call_id, tag, cseq, remote_rtp_ip, remote_rtp_port, to_header, codec = result
+        state.codec = codec
+        state.recorder.codec = codec
         state.sip_sock = sip_sock
         state.sip_call_info = (local_ip, call_id, tag, cseq, to_header)
-        print("[*] Call established! Starting AI agent...")
+        print(f"[*] Call established! Codec: {codec}. Starting AI agent...")
+
+        # Encode pre-synthesized greeting PCM to the negotiated codec
+        greeting_audio = pcm_to_g711(greeting_pcm, codec)
+        print(f"[*] Greeting audio encoded ({len(greeting_audio)} bytes, {codec})")
+
 
         # Step 5: Connect Soniox + start all threads BEFORE greeting
         print("[STT] Connecting to Soniox...")
@@ -1468,7 +1550,7 @@ def handle_incoming_call(sip_sock, local_ip, invite_data, addr):
     print("[SIP-IN] Pre-synthesizing message...")
     cartesia_client = Cartesia(api_key=CARTESIA_API_KEY)
     tts_ws = cartesia_client.tts.websocket()
-    ulaw_audio = cartesia_tts_ulaw(INCOMING_MESSAGE, tts_ws, cartesia_client)
+    ulaw_audio = cartesia_tts_g711(INCOMING_MESSAGE, tts_ws, cartesia_client)
     try:
         tts_ws.close()
     except Exception:
@@ -1493,7 +1575,8 @@ def handle_incoming_call(sip_sock, local_ip, invite_data, addr):
         f"s=VoIPAgent\r\n"
         f"c=IN IP4 {local_ip}\r\n"
         f"t=0 0\r\n"
-        f"m=audio {rtp_port_in} RTP/AVP 0 101\r\n"
+        f"m=audio {rtp_port_in} RTP/AVP 8 0 101\r\n"
+        f"a=rtpmap:8 PCMA/8000\r\n"
         f"a=rtpmap:0 PCMU/8000\r\n"
         f"a=rtpmap:101 telephone-event/8000\r\n"
         f"a=fmtp:101 0-15\r\n"

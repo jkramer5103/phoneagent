@@ -11,6 +11,7 @@ dependencies = [
     "gtts>=2.5.4",
     "httpx>=0.28.1",
     "miniaudio>=1.61",
+    "numpy>=2.4.2",
     "python-dotenv>=1.2.1",
     "pyvoip>=1.6.8",
     "uvicorn>=0.40.0",
