@@ -57,8 +57,9 @@ An information request needs an answer, not an unsolicited booking or purchase.
 Evaluate the latest offer, not a rejected earlier one. Corrections replace earlier
 facts; acknowledge once and recalculate totals from the current components.
 If an offer meets the task, proceed rather than inventing a reason to reject it.
-If a stated tradeoff has an unclear effect on the requested service, ask one
-concrete question about that effect before deciding. Do not invent a preference.
+If the provider indicates another option that may meet the task, clarify its
+terms before rejecting the task. A limit applies to the option you choose, not
+to every option mentioned. Do not invent a preference or demand new concessions.
 When declining, give the actual reason tied to the task, briefly and honestly.
 Ask the service provider to clarify facts they can know. If they request personal
 information absent from the task, say you do not have it; ask whether the task
@@ -85,7 +86,8 @@ then delegate to the application. Do not wait for permission to disconnect.
 If asked to disconnect immediately, delegate without another farewell.
 Continue listening and answering while task work remains. Do not delegate just
 because a price was offered or a calculation is needed. Never narrate internal
-work, tools or hanging up. After your final farewell, remain silent.
+work, tools or hanging up. After your final farewell, remain silent unless the
+application corrects a premature closing and asks you to resume.
 """.strip()
 
 
@@ -918,24 +920,38 @@ class LiveCallEvents:
 
     def apply_review(self, revision: int, input_revision: int,
                      decision: LifecycleDecision) -> None:
-        if (input_revision != self.input_revision
-                and not (decision.action == 'end' and decision.farewell_spoken)):
+        if input_revision != self.input_revision:
             return  # The other person corrected or continued the conversation.
-        if decision.action != 'end' and revision != self.revision:
-            return  # Do not interrupt a newer answer with a stale farewell.
+        if revision != self.revision:
+            return  # A newer spoken answer can also change whether ending is valid.
         self.apply_lifecycle(decision)
 
     def apply_lifecycle(self, decision: LifecycleDecision) -> None:
         if self.end_requested_at is not None:
             return
-        if decision.action == 'keep' and self.closing_delegation_id is not None:
-            self.websocket.send_json({
-                "type": "session.instructions.append",
-                "delegation_id": self.closing_delegation_id,
-                "content": "The conversation is still ongoing. Continue the task using "
-                           "the latest facts and listen for the other person's answer. "
-                           "Do not end the call or use an earlier closing decision.",
-            })
+        if decision.action == 'keep':
+            if decision.message:
+                self.websocket.send_json({
+                    "type": "session.instructions.append",
+                    "delegation_id": self.closing_delegation_id,
+                    "content": "The earlier closing was premature: a material option is "
+                               "unresolved. Resume the conversation. Ask the supplied "
+                               "clarification once, then listen. Do not repeat the farewell.",
+                })
+                self.websocket.send_json({
+                    "type": "session.commentary.append",
+                    "delegation_id": self.closing_delegation_id,
+                    "content": decision.message,
+                })
+                print("Lifecycle requested clarification of an overlooked option.", flush=True)
+            elif self.closing_delegation_id is not None:
+                self.websocket.send_json({
+                    "type": "session.instructions.append",
+                    "delegation_id": self.closing_delegation_id,
+                    "content": "The conversation is still ongoing. Continue the task using "
+                               "the latest facts and listen for the other person's answer. "
+                               "Do not end the call or use an earlier closing decision.",
+                })
             self.closing_delegation_id = None
             self.close_intent_at = None
         elif decision.action == 'end':

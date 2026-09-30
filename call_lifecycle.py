@@ -17,14 +17,22 @@ Choose exactly one state:
   that fits the task but has not yet been accepted or confirmed, an unanswered
   question, an incomplete utterance, and a new offer before the final farewell.
   Do not end a book-or-order task merely because a price or slot was offered.
+  A provider's indicated alternative that may meet the requirements is still
+  task work, even if its exact terms are unknown. Clarify those terms before
+  treating the task as impossible; this is evaluating an existing option,
+  not inventing a new negotiation.
 - ready_to_close: The requested task has been fulfilled, cannot be fulfilled, or
   the other person is ending the conversation, but the agent has not yet spoken
   a final closing statement. Supply one brief, honest farewell in the task's
   language (German if unspecified). Explain failure only with actual facts.
   An unconfirmed booking that can still be confirmed is ongoing, not blocked.
 - farewell_complete: The agent has actually finished its final closing statement.
-  This commits ending the call even if the other person later says hello or the
-  task was unfinished. A quoted or discussed farewell is not a final farewell.
+  Also verify that ending was justified: the task is fulfilled, impossible with
+  the available options, or the other person is ending it. An agent's mistaken
+  farewell does not make an unresolved valid option disappear. If a material
+  alternative was overlooked, use ongoing and supply one short repair question.
+  Mere hello/acknowledgment after a justified farewell does not reopen the task.
+  A quoted or discussed farewell is not a final farewell.
 - disconnect_requested: The other person explicitly asks to disconnect now.
   The task may be unfinished; no extra farewell is needed.
 A native closing notice is advisory. It is not proof of task completion or a
@@ -32,8 +40,11 @@ spoken farewell. A revised offer or necessary question can still mean ongoing.
 For outcome, use completed only if the requested task was fulfilled within its
 limits, with the other person's explicit confirmation where required. Use
 unsuccessful if it could not be done, otherwise other. For ongoing use other.
-For message, supply the brief farewell only for ready_to_close; otherwise empty.
-Do not invent preferences, reasons, details, arrangements or conversational advice.
+For message, supply the brief farewell for ready_to_close. For ongoing, only
+supply a concise spoken repair if the agent prematurely closed or overlooked a
+material option; ask for its missing terms without claiming them as facts.
+Otherwise leave message empty. Do not invent preferences, reasons, details or
+arrangements. Do not repair a merely unfinished normal conversation.
 """.strip()
 
 

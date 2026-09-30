@@ -231,14 +231,19 @@ class LiveBridgeTests(unittest.TestCase):
         self.assertIsNone(handler.end_requested_at)
         self.assertEqual(ws.send_json.call_args.args[0]['type'], 'session.instructions.append')
 
-    def test_completed_farewell_remains_terminal_despite_caller_hello(self):
+    def test_new_input_requires_fresh_review_even_after_agent_farewell(self):
         handler = LiveCallEvents(Mock())
         revision, input_revision = handler.revision, handler.input_revision
-        handler.handle({'type': 'session.input_transcript.delta', 'delta': 'Hallo? Hallo?'})
-        handler.apply_review(revision, input_revision,
-                             LifecycleDecision('end', 'other', '', 'Final farewell completed', True))
-        self.assertIsNotNone(handler.end_requested_at)
-
+        handler.handle({'type': 'session.input_transcript.delta', 'delta': 'Es geht günstiger.'})
+        decision = LifecycleDecision('end', 'other', '', 'Final farewell completed', True)
+        handler.apply_review(revision, input_revision, decision)
+        self.assertIsNone(handler.end_requested_at)
+        handler.apply_review(handler.revision, handler.input_revision,
+                             LifecycleDecision('keep', 'other', 'Was kostet die andere Option?',
+                                               'Alternative not clarified'))
+        self.assertIsNone(handler.end_requested_at)
+        self.assertEqual(handler.websocket.send_json.call_args.args[0]['type'],
+                         'session.commentary.append')
 
     def test_calendar_uses_berlin_weekdays_and_month_rollover(self):
         context = calendar_context(datetime(2026, 9, 30, 13, tzinfo=ZoneInfo('Europe/Berlin')))

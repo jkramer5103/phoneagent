@@ -96,8 +96,9 @@ recognize a spoken closing when GPT-Live omitted its native delegation.
 Only a validated model decision ends the call: further model audio is blocked,
 the queued final speech drains, and SIP BYE disconnects the telephone. An explicit
 request for immediate disconnection can skip the farewell. New caller transcript
-fragments invalidate older pending decisions; an already spoken final farewell
-remains terminal. There are no transcript keyword or regex hangup rules, and a mention or quotation of a farewell is not a closing decision.
+fragments invalidate older decisions. A farewell ends the call only when the
+full context supports ending; overlooked viable alternatives get a clarification
+instead. A simple acknowledgment after a justified farewell does not reopen it. There are no transcript keyword or regex hangup rules, and a mention or quotation of a farewell is not a closing decision.
 The reviewer makes additional Responses API requests while the conversation runs.
 
 GPT-Live uses client delegation. The reviewer records `completed`, `unsuccessful`,
@@ -121,6 +122,13 @@ call that plays three beeps.
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile telephone_agent.py call_lifecycle.py restaurant_call.py speedport_call.py
+```
+
+Optional semantic regressions against the real backend (API usage, no telephone
+calls or generated audio):
+
+```bash
+python3 tests/eval_call_lifecycle.py
 ```
 
 Official docs: [GPT-Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets?api=live),
