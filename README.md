@@ -20,6 +20,18 @@ at most 60 euros, under Kramer. Replace it with your own task. Both the voice
 agent and its backend receive your instructions. They also receive the current
 Berlin date plus the dates and weekdays for tomorrow and the next day.
 
+Short requests are enough, for example:
+
+- `Reserviere morgen um 19 Uhr einen Tisch für zwei auf Kramer.`
+- `Frag, ob mein Laptop auf Kramer abholbereit ist.`
+- `Buche einen Haarschnitt morgen nachmittags bis 40 Euro auf Kramer.`
+
+The shared conversation policy applies to every task: use the latest corrected
+facts, respect inclusive limits, avoid invented preferences, ask about relevant
+uncertainties, and distinguish collecting information from making a booking.
+Include personal details or limits when the task needs them. The agent cannot
+supply facts you have not provided or learned during the call.
+
 ## Credentials
 
 Put these in `.env` in your working directory, or in environment variables:
