@@ -8,6 +8,8 @@ import unittest
 import argparse
 import tempfile
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import Mock, patch
 
 from telephone_agent import (
@@ -15,6 +17,7 @@ from telephone_agent import (
     pcmu_has_speech, rtp_payload, start_live_session, stream_rtp_to_live,
     load_call_config, normalize_number,
     local_lan_interface, parse_args,
+    calendar_context,
 )
 
 
@@ -86,7 +89,7 @@ class LiveBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'invalid_model'):
             start_live_session(failed, live_session_event('unavailable'))
 
-    def test_tool_result_continues_backend_without_item_response_id(self):
+    def test_terminal_tool_does_not_restart_backend_without_item_response_id(self):
         ws = Mock()
         handler = LiveCallEvents(ws)
         def backend(event):
@@ -103,11 +106,53 @@ class LiveBridgeTests(unittest.TestCase):
         self.assertEqual(result['type'], 'response.item.create')
         self.assertEqual(result['item']['call_id'], 'c1')
         backend({'type': 'response.completed', 'response': {'id': 'r1', 'output': []}})
-        self.assertEqual(ws.send_json.call_args.args[0], {'type': 'response.create'})
-        self.assertFalse(handler.backend_done)
+        self.assertEqual(ws.send_json.call_count, 1)
+        self.assertEqual(handler.end_outcome, 'completed')
         backend({'type': 'response.created', 'response': {'id': 'r2'}})
         backend({'type': 'response.completed', 'response': {'id': 'r2', 'output': []}})
-        self.assertTrue(handler.backend_done)
+        self.assertEqual(ws.send_json.call_count, 1)
+
+    def test_late_audio_cannot_extend_goodbye_or_cut_off_partial_tail(self):
+        sender = RtpAudioSender(Mock(), ('127.0.0.1', 12345))
+        handler = LiveCallEvents(Mock(), sender)
+        goodbye = b'\x90' * 197  # Final speech doesn't fill a 20 ms packet.
+        handler.handle({'type': 'session.output_audio.delta',
+                        'delta': base64.b64encode(goodbye).decode()})
+        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
+            'type': 'response.created', 'response': {'id': 'r'},
+        }})
+        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
+            'type': 'response.output_item.done', 'item': {
+                'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
+                'arguments': '{"outcome":"other"}',
+            },
+        }})
+        self.assertEqual(sender.buffer, goodbye + b'\xff' * 123)
+        handler.handle({'type': 'session.output_audio.delta',
+                        'delta': base64.b64encode(b'\x90' * 8000).decode()})
+        sender.add(b'\x90' * 8000)  # Gate also protects direct sender users.
+        self.assertEqual(sender.buffer, goodbye + b'\xff' * 123)
+        self.assertFalse(sender.speech_drained(0))
+        sender.start()
+        try:
+            deadline = time.monotonic() + 1
+            while not sender.speech_drained(0) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(sender.speech_drained(0))
+            packets = [call.args[0] for call in sender.sock.sendto.call_args_list]
+            played = b''.join(rtp_payload(packet) for packet in packets)
+            self.assertTrue(played.startswith(goodbye))
+            self.assertFalse(pcmu_has_speech(played[len(goodbye):]))
+        finally:
+            sender.stop()
+
+    def test_calendar_uses_berlin_weekdays_and_month_rollover(self):
+        context = calendar_context(datetime(2026, 9, 30, 13, tzinfo=ZoneInfo('Europe/Berlin')))
+        self.assertIn('Heute / today: Mittwoch, 2026-09-30', context)
+        self.assertIn('Morgen / tomorrow: Donnerstag, 2026-10-01', context)
+        self.assertIn('Übermorgen / day after tomorrow: Freitag, 2026-10-02', context)
+        context = calendar_context(datetime(2026, 9, 30, 23, tzinfo=ZoneInfo('UTC')))
+        self.assertIn('Heute / today: Donnerstag, 2026-10-01', context)
 
     def test_invalid_tool_cannot_schedule_hangup(self):
         ws = Mock()
@@ -123,6 +168,10 @@ class LiveBridgeTests(unittest.TestCase):
         }})
         self.assertIsNone(handler.end_requested_at)
         self.assertFalse(json.loads(ws.send_json.call_args.args[0]['item']['output'])['ok'])
+        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
+            'type': 'response.completed', 'response': {'id': 'r'},
+        }})
+        self.assertEqual(ws.send_json.call_args.args[0], {'type': 'response.create'})
 
     def test_both_transcript_streams_keep_exact_fragments_and_times(self):
         handler = LiveCallEvents(Mock())

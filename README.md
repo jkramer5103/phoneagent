@@ -14,10 +14,11 @@ python3 telephone_agent.py
 # Or: uv run telephone_agent.py
 ```
 
-The included test task is a pizza-place reservation for two people under Kramer,
-with an offered time between 19:30 and 20:30. Replace it with your own task. Both the voice agent and its backend receive
-your instructions;
-there are no built-in reservation details or restaurant rules.
+The included test task asks a bicycle workshop for a rear-tire replacement,
+a slot tomorrow between 14:00 and 17:00 (or the next day), and a total price of
+at most 60 euros, under Kramer. Replace it with your own task. Both the voice
+agent and its backend receive your instructions. They also receive the current
+Berlin date plus the dates and weekdays for tomorrow and the next day.
 
 ## Credentials
 
@@ -74,11 +75,16 @@ Timed transcript fragments for each speaker appear in the terminal. GPT-Live
 handles listening, speech, and interruptions continuously.
 
 The backend's `end_call` tool records `completed`, `unsuccessful`, or `other`.
-The script waits for backend completion and queued speech playback plus a second
-of quiet output before hanging up. This quiet interval uses a local audio-energy
+`end_call` is terminal: it does not start another backend response. Once the
+tool requests hangup, later model audio is blocked; only audio already queued
+for the goodbye is played. The final partial RTP packet is padded with silence.
+The script waits for that speech to play plus a second of quiet output before
+hanging up. This quiet interval uses a local audio-energy
 heuristic because Live has no speech-completed event. Remote hangups and the
 maximum duration also end the call. Finally, it closes the Live session and prints
-final usage. Success reflects what was confirmed in the conversation.
+final usage. Appointment success requires the other person's confirmation of
+the final date, time and name. Contradictory or missing details must be clarified;
+no booking system is connected, so success reflects verbal confirmation.
 
 `restaurant_call.py` remains a compatibility launcher for the same general agent.
 `speedport_call.py` supplies its SIP primitives and can separately make a test

@@ -22,7 +22,9 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from speedport_call import (
     SipClient,
@@ -41,12 +43,17 @@ VOICE_GUIDANCE = """
 Follow the call instructions below. Speak naturally and briefly in the requested
 language. Listen to the other person's greeting first; ask when details are
 unclear and do not invent facts.
+For appointments, clarify conflicting dates and times, then ask the other
+person to confirm the final date, time and name before claiming a booking.
+Use the calendar context below; never agree to a conflicting weekday.
+Do not invent arrangements such as sorting missing details out on arrival.
 Backchannel policy: Acknowledge briefly without taking over.
 Interruption policy: Yield, listen, then continue appropriately.
 Delegation policy:
 Backend tools: End the call and record its outcome.
 Delegate to the backend when: The task is finished, cannot be completed, or the
-other person wants to end the call. Say goodbye first, then delegate hanging up.
+other person wants to end the call. Say one short goodbye, then delegate hanging
+up silently. Do not announce tools, narrate hanging up, or speak after goodbye.
 Do not delegate to the backend when: The conversation is still ongoing.
 """.strip()
 
@@ -55,8 +62,24 @@ Follow the same call instructions as the voice agent. After its spoken goodbye,
 use end_call: completed if the requested task was confirmed as done,
 unsuccessful if it could not be done, otherwise other. Do not report success
 based only on an offer or the agent's own claim. While the conversation is
-ongoing, do not end it. Keep your reply short and in the conversation's language.
+ongoing, do not end it. For appointments, completed requires the other person's
+confirmation of the final date, time and name, including any corrections.
+Check dates against the calendar context; a conflicting weekday is unresolved.
+Unresolved details mean other, not completed. Do not propose an unagreed plan.
+end_call is terminal: after it, return no explanation or spoken summary.
 """.strip()
+
+
+def calendar_context(now: datetime | None = None) -> str:
+    now = now or datetime.now(ZoneInfo("Europe/Berlin"))
+    today = now.astimezone(ZoneInfo("Europe/Berlin")).date()
+    weekdays = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+    lines = ["Calendar context (Europe/Berlin):"]
+    for label, offset in (("Heute / today", 0), ("Morgen / tomorrow", 1),
+                          ("Übermorgen / day after tomorrow", 2)):
+        day = today + timedelta(days=offset)
+        lines.append(f"{label}: {weekdays[day.weekday()]}, {day.isoformat()}.")
+    return "\n".join(lines)
 
 
 def read_text_file(path: str | Path, label: str) -> str:
@@ -396,6 +419,7 @@ class RtpAudioSender:
         self.buffer = bytearray()
         self.condition = threading.Condition()
         self.stopped = False
+        self.accepting_audio = True
         self.in_flight = False
         self.received_bytes = 0
         self.played_bytes = 0
@@ -412,11 +436,22 @@ class RtpAudioSender:
 
     def add(self, pcmu: bytes) -> None:
         with self.condition:
+            if not self.accepting_audio:
+                return
             self.buffer.extend(pcmu)
             self.received_bytes += len(pcmu)
             if pcmu_has_speech(pcmu):
                 self.last_speech_byte = self.received_bytes
             self.condition.notify()
+
+    def finish(self) -> None:
+        """Freeze playback at the already queued goodbye, retaining its tail."""
+        with self.condition:
+            self.accepting_audio = False
+            # RTP uses complete 160-byte packets; a final partial packet must
+            # be padded rather than waiting indefinitely for more model audio.
+            self.buffer.extend(b"\xff" * (-len(self.buffer) % 160))
+            self.condition.notify_all()
 
     def speech_drained(self, quiet_seconds: float = 1.0) -> bool:
         with self.condition:
@@ -735,11 +770,12 @@ def live_session_event(
     model: str, backend_model: str = "gpt-6-luna", voice: str = "marin",
     instructions: str = "Say hello briefly.",
 ) -> dict:
+    context = calendar_context() + "\n\nCall instructions:\n" + instructions
     return {
         "type": "session.start",
         "session": {
             "model": model,
-            "instructions": VOICE_GUIDANCE + "\n\nCall instructions:\n" + instructions,
+            "instructions": VOICE_GUIDANCE + "\n\n" + context,
             "audio": {
                 "format": {"type": "audio/pcmu", "rate": 8000},
                 "output": {"voice": voice},
@@ -748,7 +784,7 @@ def live_session_event(
                 "type": "responses",
                 "responses": {
                     "model": backend_model,
-                    "instructions": BACKEND_GUIDANCE + "\n\nCall instructions:\n" + instructions,
+                    "instructions": BACKEND_GUIDANCE + "\n\n" + context,
                     "tools": [{
                         "type": "function", "name": "end_call",
                         "description": "Record the outcome and hang up after the spoken goodbye.",
@@ -823,10 +859,11 @@ def finalize_live_session(websocket: RawWebSocket, timeout: float = 15) -> bool:
 class LiveCallEvents:
     """Track delegated tools independently of the continuous voice stream."""
 
-    def __init__(self, websocket: RawWebSocket) -> None:
+    def __init__(self, websocket: RawWebSocket, sender: RtpAudioSender | None = None) -> None:
         self.websocket = websocket
+        self.sender = sender
         self.end_requested_at: float | None = None
-        self.backend_done = False
+        self.end_outcome: str | None = None
         self.conversation_started = False
         self.handled_calls: set[str] = set()
         self.pending_results: set[str] = set()
@@ -835,6 +872,10 @@ class LiveCallEvents:
 
     def handle(self, event: dict) -> None:
         kind = event.get("type")
+        if kind == "session.output_audio.delta":
+            if self.sender and self.end_requested_at is None:
+                self.sender.add(base64.b64decode(event.get("delta", "")))
+            return
         if kind == "error":
             raise live_error(event)
         if kind == "session.closed":
@@ -850,6 +891,8 @@ class LiveCallEvents:
                   f"{event.get('delta', '')}", flush=True)
         elif kind == "response.event":
             nested = event.get("event", {})
+            if nested.get("type") == "response.output_text.delta":
+                print(f"Backend (not spoken): {nested.get('delta', '')}", flush=True)
             delegation_id = event.get("delegation_id", "")
             response_id = nested.get("response", {}).get("id")
             if nested.get("type") == "response.created" and response_id:
@@ -863,7 +906,12 @@ class LiveCallEvents:
                     raise RuntimeError("Delegated function has no call_id")
                 if call_id in self.handled_calls:
                     return
+                if self.end_requested_at is not None:
+                    return  # A terminal tool cannot start another conversation.
                 self.handled_calls.add(call_id)
+                tool_response_id = nested.get("response_id") or self.response_ids.get(delegation_id)
+                if not tool_response_id:
+                    raise RuntimeError("Delegated function has no associated response")
                 arguments = json.loads(item.get("arguments", "{}"))
                 outcome = arguments.get("outcome")
                 if item.get("name") != "end_call" or outcome not in {
@@ -873,9 +921,10 @@ class LiveCallEvents:
                 else:
                     if self.end_requested_at is None:
                         self.end_requested_at = time.monotonic()
-                    self.backend_done = False
-                    result = {"ok": True, "outcome": outcome,
-                              "hangup": "scheduled after goodbye playback; do not speak again"}
+                    self.end_outcome = outcome
+                    if self.sender:
+                        self.sender.finish()
+                    result = {"ok": True, "outcome": outcome}
                     print(f"Agent requested hangup: {outcome}")
                 self.websocket.send_json({
                     "type": "response.item.create",
@@ -884,16 +933,12 @@ class LiveCallEvents:
                 })
                 # Forwarded item events don't include a response_id. Use the
                 # response.created envelope for this delegation instead.
-                tool_response_id = nested.get("response_id") or self.response_ids.get(delegation_id)
-                if not tool_response_id:
-                    raise RuntimeError("Delegated function has no associated response")
-                self.pending_results.add(tool_response_id)
+                if self.end_requested_at is None:
+                    self.pending_results.add(tool_response_id)
             elif nested.get("type") == "response.completed":
-                if response_id in self.pending_results:
+                if response_id in self.pending_results and self.end_requested_at is None:
                     self.pending_results.remove(response_id)
                     self.websocket.send_json({"type": "response.create"})
-                elif self.end_requested_at is not None:
-                    self.backend_done = True
             elif nested.get("type") in ("response.failed", "response.incomplete"):
                 raise RuntimeError(f"Delegated backend failed: {nested.get('response')}")
 
@@ -919,7 +964,7 @@ def bridge_live(
     )
     rtp_thread.start()
     sip_thread.start()
-    events = LiveCallEvents(websocket)
+    events = LiveCallEvents(websocket, sender)
     greeting_sent = False
     try:
         while not stop.is_set() and time.monotonic() - started < max_seconds:
@@ -934,8 +979,7 @@ def bridge_live(
                                "to the call instructions, then listen.",
                 })
                 greeting_sent = True
-            if (events.end_requested_at is not None and events.backend_done
-                    and now - events.end_requested_at >= 2 and sender.speech_drained()):
+            if events.end_requested_at is not None and sender.speech_drained():
                 break
             try:
                 raw = websocket.recv_text()
@@ -944,10 +988,7 @@ def bridge_live(
             if raw is None:
                 raise ConnectionError("Live WebSocket closed during the call")
             event = json.loads(raw)
-            if event.get("type") == "session.output_audio.delta":
-                sender.add(base64.b64decode(event.get("delta", "")))
-            else:
-                events.handle(event)
+            events.handle(event)
         else:
             if not stop.is_set():
                 print("Maximum call duration reached.")
