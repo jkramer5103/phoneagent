@@ -86,22 +86,31 @@ G.711 μ-law audio directly between the call and OpenAI, without resampling.
 Timed transcript fragments for each speaker appear in the terminal. GPT-Live
 handles listening, speech, and interruptions continuously.
 
-The voice model decides when to close the call. Its backend delegation forces
-the named `end_call` function, which records `completed`, `unsuccessful`, or
-`other`. The backend classifies the outcome; it cannot reopen negotiations with
-text advice. No transcript keyword or regex triggers hangup.
-Because the only delegated capability is terminal `end_call`, the native
-`session.delegation.created` event begins closing immediately. Outcome reasoning
-runs separately and cannot delay the telephone disconnect. No new model audio
-is accepted after the handoff; only the already queued final speech is played.
-`end_call` does not start another backend response. The final partial RTP packet is padded with silence.
-The script waits for that speech to play plus a second of quiet output before
-hanging up. This quiet interval uses a local audio-energy
-heuristic because Live has no speech-completed event. Remote hangups and the
-maximum duration also end the call. Finally, it closes the Live session and prints
-final usage. Appointment success requires the other person's confirmation of
-the final date, time and name. Contradictory or missing details must be clarified;
-no booking system is connected, so success reflects verbal confirmation.
+A closing handoff records intent; it does not immediately disconnect the phone.
+A separate lifecycle reviewer uses the backend model and Structured Outputs to
+assess the full conversation after speech pauses. It distinguishes ongoing
+conversation, a missing farewell, and a completed closing statement. If a
+farewell is missing, it requests one brief statement from GPT-Live. It can also
+recognize a spoken closing when GPT-Live omitted its native delegation.
+
+Only a validated model decision ends the call: further model audio is blocked,
+the queued final speech drains, and SIP BYE disconnects the telephone. An explicit
+request for immediate disconnection can skip the farewell. New caller transcript
+fragments invalidate older pending decisions; an already spoken final farewell
+remains terminal. There are no transcript keyword or regex hangup rules, and a mention or quotation of a farewell is not a closing decision.
+The reviewer makes additional Responses API requests while the conversation runs.
+
+GPT-Live uses client delegation. The reviewer records `completed`, `unsuccessful`,
+or `other`; there is no managed terminal function loop to leave waiting. Missing
+farewells return through `session.commentary.append`, which supplies spoken content.
+Inbound PCMU is sent as 800 samples per 100ms of wall time; receive timeouts
+never add extra samples on top of late packets. Partial output RTP packets are
+padded with silence so their tails play even before the final closing decision. The final drain uses
+an audio-energy estimate because Live has no speech-completed event; this does
+not decide whether the conversation has ended. Remote hangups and the maximum
+duration also end the call. Finally, the script closes the Live session and
+prints final usage. Success for bookings reflects verbal confirmation; no booking
+system is connected.
 
 `restaurant_call.py` remains a compatibility launcher for the same general agent.
 `speedport_call.py` supplies its SIP primitives and can separately make a test
@@ -111,7 +120,7 @@ call that plays three beeps.
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile telephone_agent.py restaurant_call.py speedport_call.py
+python3 -m py_compile telephone_agent.py call_lifecycle.py restaurant_call.py speedport_call.py
 ```
 
 Official docs: [GPT-Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets?api=live),

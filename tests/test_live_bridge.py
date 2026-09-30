@@ -12,6 +12,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from unittest.mock import Mock, patch
 
+from call_lifecycle import LifecycleDecision
+
 from telephone_agent import (
     LiveCallEvents, RawWebSocket, RtpAudioSender, live_session_event,
     pcmu_has_speech, rtp_payload, start_live_session, stream_rtp_to_live,
@@ -49,16 +51,14 @@ class LiveBridgeTests(unittest.TestCase):
             self.assertEqual(args.destination, '+4915123456789')
             session = live_session_event('gpt-live-1', instructions=args.instructions)['session']
             self.assertIn(args.instructions, session['instructions'])
-            self.assertIn(args.instructions, session['delegation']['responses']['instructions'])
+            self.assertEqual(session['delegation'], {'type': 'client'})
             instructions.write_text('  \n', encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'empty'):
                 load_call_config(args)
 
-    def test_closing_delegation_requires_terminal_function(self):
-        backend = live_session_event('gpt-live-1')['session']['delegation']['responses']
-        self.assertEqual(backend['tool_choice'], {'type': 'function', 'name': 'end_call'})
-        self.assertEqual([tool['name'] for tool in backend['tools']], ['end_call'])
-        self.assertFalse(backend['parallel_tool_calls'])
+    def test_client_handoff_does_not_start_a_pending_tool_loop(self):
+        self.assertEqual(live_session_event('gpt-live-1')['session']['delegation'],
+                         {'type': 'client'})
 
     def test_transcript_text_never_executes_hangup(self):
         ws = Mock()
@@ -107,28 +107,6 @@ class LiveBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'invalid_model'):
             start_live_session(failed, live_session_event('unavailable'))
 
-    def test_terminal_tool_does_not_restart_backend_without_item_response_id(self):
-        ws = Mock()
-        handler = LiveCallEvents(ws)
-        def backend(event):
-            handler.handle({'type': 'response.event', 'delegation_id': 'd1', 'event': event})
-        backend({'type': 'response.created', 'response': {'id': 'r1'}})
-        item = {'type': 'response.output_item.done', 'item': {
-            'type': 'function_call', 'call_id': 'c1', 'name': 'end_call',
-            'arguments': '{"outcome":"completed"}',
-        }}
-        backend(item)
-        backend(item)  # duplicate delivery must not execute twice
-        self.assertEqual(ws.send_json.call_count, 1)
-        result = ws.send_json.call_args.args[0]
-        self.assertEqual(result['type'], 'response.item.create')
-        self.assertEqual(result['item']['call_id'], 'c1')
-        backend({'type': 'response.completed', 'response': {'id': 'r1', 'output': []}})
-        self.assertEqual(ws.send_json.call_count, 1)
-        self.assertEqual(handler.end_outcome, 'completed')
-        backend({'type': 'response.created', 'response': {'id': 'r2'}})
-        backend({'type': 'response.completed', 'response': {'id': 'r2', 'output': []}})
-        self.assertEqual(ws.send_json.call_count, 1)
 
     def test_late_audio_cannot_extend_goodbye_or_cut_off_partial_tail(self):
         sender = RtpAudioSender(Mock(), ('127.0.0.1', 12345))
@@ -136,15 +114,7 @@ class LiveBridgeTests(unittest.TestCase):
         goodbye = b'\x90' * 197  # Final speech doesn't fill a 20 ms packet.
         handler.handle({'type': 'session.output_audio.delta',
                         'delta': base64.b64encode(goodbye).decode()})
-        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-            'type': 'response.created', 'response': {'id': 'r'},
-        }})
-        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-            'type': 'response.output_item.done', 'item': {
-                'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
-                'arguments': '{"outcome":"other"}',
-            },
-        }})
+        handler.apply_lifecycle(LifecycleDecision('end', 'other', '', 'Agent finished farewell'))
         self.assertEqual(sender.buffer, goodbye + b'\xff' * 123)
         handler.handle({'type': 'session.output_audio.delta',
                         'delta': base64.b64encode(b'\x90' * 8000).decode()})
@@ -164,7 +134,7 @@ class LiveBridgeTests(unittest.TestCase):
         finally:
             sender.stop()
 
-    def test_native_handoff_closes_before_slow_outcome_backend(self):
+    def test_handoff_waits_for_farewell_then_closes_without_outcome_delay(self):
         rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rtp.bind(('127.0.0.1', 0))
         rtp.settimeout(.02)
@@ -172,54 +142,103 @@ class LiveBridgeTests(unittest.TestCase):
         sink.bind(('127.0.0.1', 0))
         ws = Mock()
         queue = [
+            {'type': 'session.delegation.created',
+             'delegation': {'id': 'd', 'target': 'client'}},
             {'type': 'session.output_audio.delta',
              'delta': base64.b64encode(b'\x90' * 197).decode()},
-            {'type': 'session.delegation.created',
-             'delegation': {'id': 'd', 'target': 'responses'}},
-            {'type': 'session.output_audio.delta',
-             'delta': base64.b64encode(b'\x90' * 8000).decode()},
+            {'type': 'session.output_transcript.delta', 'delta': 'Vielen Dank, auf Wiederhören.'},
         ]
         def receive():
             if queue:
                 return json.dumps(queue.pop(0))
-            # The backend has not supplied any outcome or function call.
             time.sleep(.02)
             raise socket.timeout()
         ws.recv_text.side_effect = receive
+        reviewer = Mock(pending=False)
+        reviews = []
+        def submit(revision, input_revision, history, closing_pending):
+            self.assertTrue(closing_pending)
+            self.assertEqual(history[-1]['text'], 'Vielen Dank, auf Wiederhören.')
+            reviews.append((revision, input_revision,
+                            LifecycleDecision('end', 'unsuccessful', '', 'Farewell spoken')))
+        reviewer.submit.side_effect = submit
+        reviewer.poll.side_effect = lambda: reviews.pop(0) if reviews else None
         try:
             started = time.monotonic()
             with patch('telephone_agent.monitor_sip'):
                 remote, events = bridge_live(Mock(), Mock(rtp=rtp, rtp_target=sink.getsockname()),
-                                             ws, max_seconds=5)
+                                             ws, max_seconds=5, lifecycle=reviewer)
             self.assertLess(time.monotonic() - started, 2)
             self.assertFalse(remote)
             self.assertIsNotNone(events.end_requested_at)
-            self.assertIsNone(events.end_outcome)
-            self.assertEqual(events.sender.received_bytes, 197)
+            self.assertEqual(events.end_outcome, 'unsuccessful')
+            self.assertEqual(events.sender.received_bytes, 320)
+            reviewer.close.assert_called_once()
         finally:
             rtp.close()
             sink.close()
 
-    def test_outcome_finishes_after_phone_disconnect_without_more_speech(self):
-        ws = Mock(started=True, finalized=False, closed=False)
+    def test_native_intent_does_not_cut_off_unspoken_farewell(self):
+        sender = RtpAudioSender(Mock(), ('127.0.0.1', 12345))
+        handler = LiveCallEvents(Mock(), sender)
+        handler.handle({'type': 'session.delegation.created',
+                        'delegation': {'id': 'd', 'target': 'client'}})
+        self.assertIsNotNone(handler.close_intent_at)
+        self.assertIsNone(handler.end_requested_at)
+        handler.handle({'type': 'session.output_audio.delta',
+                        'delta': base64.b64encode(b'\x90' * 197).decode()})
+        self.assertEqual(len(sender.buffer), 197)
+        self.assertTrue(sender.accepting_audio)
+
+    def test_lifecycle_requests_one_farewell_without_disconnecting(self):
+        ws = Mock()
+        handler = LiveCallEvents(ws)
+        decision = LifecycleDecision('say_goodbye', 'unsuccessful',
+                                     'Das ist zu teuer. Vielen Dank, auf Wiederhören.',
+                                     'Over the user budget, no farewell yet')
+        handler.apply_lifecycle(decision)
+        handler.apply_lifecycle(decision)
+        self.assertIsNone(handler.end_requested_at)
+        self.assertEqual(ws.send_json.call_count, 1)
+        self.assertEqual(ws.send_json.call_args.args[0]['type'], 'session.commentary.append')
+        handler.apply_lifecycle(LifecycleDecision('end', 'unsuccessful', '', 'Farewell spoken'))
+        self.assertIsNotNone(handler.end_requested_at)
+
+    def test_new_caller_correction_invalidates_pending_end_decision(self):
+        handler = LiveCallEvents(Mock())
+        revision, input_revision = handler.revision, handler.input_revision
+        handler.handle({'type': 'session.input_transcript.delta',
+                        'delta': 'Warten Sie, ich habe ein neues Angebot.'})
+        handler.apply_review(revision, input_revision,
+                             LifecycleDecision('end', 'other', '', 'Earlier goodbye'))
+        self.assertIsNone(handler.end_requested_at)
+        handler.apply_review(handler.revision, handler.input_revision,
+                             LifecycleDecision('keep', 'other', '', 'New offer under discussion'))
+        self.assertIsNone(handler.end_requested_at)
+
+    def test_new_input_cancels_unspoken_farewell_and_supersedes_old_handoff(self):
+        ws = Mock()
         handler = LiveCallEvents(ws)
         handler.handle({'type': 'session.delegation.created',
-                        'delegation': {'id': 'd', 'target': 'responses'}})
-        closing_time = handler.end_requested_at
-        ws.recv_text.side_effect = [json.dumps(event) for event in [
-            {'type': 'response.event', 'delegation_id': 'd', 'event': {
-                'type': 'response.created', 'response': {'id': 'r'}}},
-            {'type': 'response.event', 'delegation_id': 'd', 'event': {
-                'type': 'response.output_item.done', 'item': {
-                    'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
-                    'arguments': '{"outcome":"other"}'}}},
-            {'type': 'session.closed', 'usage': {'seconds': 10}},
-        ]]
-        self.assertTrue(finalize_live_session(ws, events=handler))
-        self.assertEqual(handler.end_outcome, 'other')
-        self.assertEqual(handler.end_requested_at, closing_time)
-        self.assertEqual([call.args[0]['type'] for call in ws.send_json.call_args_list],
-                         ['session.close'])
+                        'delegation': {'id': 'd', 'target': 'client'}})
+        handler.apply_lifecycle(LifecycleDecision('say_goodbye', 'unsuccessful',
+                                                 'Das ist zu teuer. Auf Wiederhören.', 'Old price'))
+        handler.handle({'type': 'session.input_transcript.delta',
+                        'delta': 'Warten Sie, ich kann es für 60 Euro anbieten.'})
+        self.assertFalse(handler.goodbye_requested)
+        self.assertIsNone(handler.close_intent_at)
+        self.assertIsNone(handler.closing_delegation_id)
+        self.assertIsNone(handler.end_requested_at)
+        self.assertEqual(ws.send_json.call_args.args[0]['type'], 'session.instructions.append')
+
+    def test_completed_farewell_remains_terminal_despite_caller_hello(self):
+        handler = LiveCallEvents(Mock())
+        revision, input_revision = handler.revision, handler.input_revision
+        handler.handle({'type': 'session.input_transcript.delta', 'delta': 'Hallo? Hallo?'})
+        handler.apply_review(revision, input_revision,
+                             LifecycleDecision('end', 'other', '', 'Final farewell completed', True))
+        self.assertIsNotNone(handler.end_requested_at)
+
 
     def test_calendar_uses_berlin_weekdays_and_month_rollover(self):
         context = calendar_context(datetime(2026, 9, 30, 13, tzinfo=ZoneInfo('Europe/Berlin')))
@@ -229,24 +248,6 @@ class LiveBridgeTests(unittest.TestCase):
         context = calendar_context(datetime(2026, 9, 30, 23, tzinfo=ZoneInfo('UTC')))
         self.assertIn('Heute / today: Donnerstag, 2026-10-01', context)
 
-    def test_invalid_tool_fails_without_restarting_conversation(self):
-        ws = Mock()
-        handler = LiveCallEvents(ws)
-        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-            'type': 'response.created', 'response': {'id': 'r'},
-        }})
-        with self.assertRaisesRegex(RuntimeError, 'Invalid terminal'):
-            handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-                'type': 'response.output_item.done', 'item': {
-                    'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
-                    'arguments': '{"outcome":"invalid"}',
-                },
-            }})
-        self.assertIsNone(handler.end_requested_at)
-        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-            'type': 'response.completed', 'response': {'id': 'r'},
-        }})
-        ws.send_json.assert_not_called()
 
     def test_both_transcript_streams_keep_exact_fragments_and_times(self):
         handler = LiveCallEvents(Mock())
@@ -280,6 +281,53 @@ class LiveBridgeTests(unittest.TestCase):
         self.assertFalse(speaking.is_set())
         self.assertEqual(sent[0]['type'], 'session.input_audio.append')
         self.assertEqual(base64.b64decode(sent[0]['audio']), b'\xff' * 800)
+
+    def test_burst_of_rtp_packets_cannot_advance_live_clock(self):
+        inbound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        inbound.bind(('127.0.0.1', 0))
+        inbound.settimeout(.02)
+        source = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        stop = threading.Event()
+        errors, sent = [], []
+        ws = Mock()
+        started = time.monotonic()
+        def send(event):
+            sent.append((time.monotonic() - started, base64.b64decode(event['audio'])))
+            if len(sent) == 4:
+                stop.set()
+        ws.send_json.side_effect = send
+        # A burst can follow scheduler/network delay. It must be buffered,
+        # rather than mistaken for 400ms that have already elapsed.
+        for sequence in range(20):
+            packet = struct.pack('!BBHII', 0x80, 0, sequence, sequence * 160, 42)
+            source.sendto(packet + b'\x90' * 160, inbound.getsockname())
+        thread = threading.Thread(target=stream_rtp_to_live,
+                                  args=(inbound, ws, stop, threading.Event(), errors))
+        thread.start()
+        try:
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(sent), 4)
+            for count, (elapsed, audio) in enumerate(sent, 1):
+                self.assertGreaterEqual(elapsed, count * .1 - .015)
+                self.assertEqual(audio, b'\x90' * 800)
+        finally:
+            stop.set()
+            thread.join(1)
+            source.close()
+            inbound.close()
+
+    def test_ongoing_review_returns_control_from_premature_client_handoff(self):
+        ws = Mock()
+        events = LiveCallEvents(ws)
+        events.handle({'type': 'session.delegation.created',
+                       'delegation': {'id': 'client-1', 'target': 'client'}})
+        events.apply_lifecycle(LifecycleDecision('keep', 'other', '', 'Offer not confirmed'))
+        self.assertIsNone(events.end_requested_at)
+        self.assertIsNone(events.close_intent_at)
+        self.assertEqual(ws.send_json.call_args.args[0]['delegation_id'], 'client-1')
+        self.assertEqual(ws.send_json.call_args.args[0]['type'], 'session.instructions.append')
 
     def test_rtp_playback_preserves_codec_and_waits_for_queued_speech(self):
         sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

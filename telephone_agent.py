@@ -26,6 +26,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from call_lifecycle import LifecycleDecision, LifecycleReviewer
+
 from speedport_call import (
     SipClient,
     digest_authorization,
@@ -77,36 +79,13 @@ after the goodbye.
 Backchannel policy: Acknowledge briefly without taking over.
 Interruption policy: Yield, listen, then continue appropriately.
 An explicit request to hang up overrides the task: stop immediately.
-Delegation policy:
-Backend tools:
-- end_call: Disconnect the telephone call and record its outcome. Only this
-  backend capability hangs up; saying goodbye does not disconnect the call.
-Delegate to the backend when:
-- The other person asks to hang up: delegate immediately, even if the task is
-  unfinished. If you already said goodbye, do not say it again.
-- The task is finished or cannot be completed: say one short goodbye, then
-  immediately delegate to end_call. A confirmed booking needs no further
-  conversational turns. Do not wait for the person to ask you to disconnect.
-Do not delegate to the backend when:
-- You are exchanging task details or waiting for a confirmation, unless the
-  other person asks to end the call.
-The handoff is terminal. Remain silent while it executes; never narrate tools,
-announce hanging up, reopen the task, or speak after the final goodbye.
-""".strip()
-
-BACKEND_GUIDANCE = """
-The voice agent delegates here only to close the call. This is a terminal
-handoff, not a request for conversational advice. Always invoke end_call.
-Classify the existing conversation: completed if the requested task was confirmed
-as done within its limits, unsuccessful if it could not be done, otherwise other.
-The caller's request to hang up overrides any unfinished task. Missing details,
-invalid offers, or mistakes do not authorize another question or correction.
-For appointments, completed requires the other person's confirmation of the
-final date, time and name, including any corrections. Check dates against the
-calendar context; a conflicting weekday is unresolved. Do not report success
-based only on an offer or the agent's own claim. Unresolved details mean other.
-Do not generate conversational text, instructions to the voice agent, or a
-spoken summary. Record the truthful outcome with end_call and stop.
+Delegation policy: The application reviews conversation state and controls hangup.
+When the task is finished or cannot be completed, say one short farewell and
+then delegate to the application. Do not wait for permission to disconnect.
+If asked to disconnect immediately, delegate without another farewell.
+Continue listening and answering while task work remains. Do not delegate just
+because a price was offered or a calculation is needed. Never narrate internal
+work, tools or hanging up. After your final farewell, remain silent.
 """.strip()
 
 
@@ -220,6 +199,7 @@ def run_on_lan_host(
             copy = subprocess.run(
                 ["scp", "-q", os.path.abspath(__file__),
                  str(PROJECT_DIR / "speedport_call.py"),
+                 str(PROJECT_DIR / "call_lifecycle.py"),
                  str(instructions_path), str(number_path),
                  f"{ssh_target}:{remote_dir}/"],
                 check=False,
@@ -464,6 +444,7 @@ class RtpAudioSender:
         self.received_bytes = 0
         self.played_bytes = 0
         self.last_speech_byte = 0
+        self.last_audio_added_at = time.monotonic()
         self.last_speech_played_at = time.monotonic()
         self.error: OSError | None = None
         self.sequence = random.randint(0, 65535)
@@ -479,6 +460,7 @@ class RtpAudioSender:
             if not self.accepting_audio:
                 return
             self.buffer.extend(pcmu)
+            self.last_audio_added_at = time.monotonic()
             self.received_bytes += len(pcmu)
             if pcmu_has_speech(pcmu):
                 self.last_speech_byte = self.received_bytes
@@ -490,7 +472,9 @@ class RtpAudioSender:
             self.accepting_audio = False
             # RTP uses complete 160-byte packets; a final partial packet must
             # be padded rather than waiting indefinitely for more model audio.
-            self.buffer.extend(b"\xff" * (-len(self.buffer) % 160))
+            padding = -len(self.buffer) % 160
+            self.buffer.extend(b"\xff" * padding)
+            self.received_bytes += padding
             self.condition.notify_all()
 
     def speech_drained(self, quiet_seconds: float = 1.0) -> bool:
@@ -516,6 +500,13 @@ class RtpAudioSender:
                         break
                 if self.stopped:
                     return
+                if (0 < len(self.buffer) < 160
+                        and time.monotonic() - self.last_audio_added_at >= .04):
+                    # A quiet stream must play its partial tail even before a
+                    # closing decision. Keep byte accounting valid for later turns.
+                    padding = 160 - len(self.buffer)
+                    self.buffer.extend(b"\xff" * padding)
+                    self.received_bytes += padding
                 model_audio = len(self.buffer) >= 160
                 if model_audio:
                     payload = bytes(self.buffer[:160])
@@ -769,38 +760,40 @@ def stream_rtp_to_live(
     rtp: socket.socket, websocket: RawWebSocket, stop: threading.Event,
     caller_speaking: threading.Event, errors: list[Exception],
 ) -> None:
+    # One 100ms PCMU chunk per 100ms of wall time. Receive timeouts do
+    # not represent missing samples: a late packet may arrive immediately after.
     audio = bytearray()
-    last_send = time.monotonic()
-    last_receive = last_send
+    next_send = time.monotonic() + .1
     received_audio = False
     try:
         while not stop.is_set():
-            try:
-                packet, _ = rtp.recvfrom(4096)
-                payload = rtp_payload(packet)
-                if payload:
-                    if not received_audio:
-                        print("Inbound RTP audio received.", flush=True)
-                        received_audio = True
-                    audio.extend(payload)
-                    last_receive = time.monotonic()
-                    if pcmu_has_speech(payload):
-                        caller_speaking.set()
-            except socket.timeout:
-                # Live needs a continuous stream, including when the phone
-                # suppresses silence or hasn't sent its first RTP packet yet.
-                now = time.monotonic()
-                if now - last_receive >= 0.02:
-                    audio.extend(b"\xff" * 160)
-                    last_receive = now
             now = time.monotonic()
-            if audio and (len(audio) >= 800 or now - last_send >= 0.1):
+            if now >= next_send:
+                chunk = bytes(audio[:800])
+                del audio[:800]
+                chunk += b"\xff" * (800 - len(chunk))
                 websocket.send_json({
                     "type": "session.input_audio.append",
-                    "audio": base64.b64encode(bytes(audio)).decode(),
+                    "audio": base64.b64encode(chunk).decode(),
                 })
-                audio.clear()
-                last_send = now
+                next_send += .1
+                if next_send <= now:
+                    next_send = now + .1  # Do not burst after a stalled send.
+            readable, _, _ = select_with_timeout(rtp, min(.02, max(0, next_send - time.monotonic())))
+            if not readable:
+                continue
+            try:
+                packet, _ = rtp.recvfrom(4096)
+            except socket.timeout:
+                continue
+            payload = rtp_payload(packet)
+            if payload:
+                if not received_audio:
+                    print("Inbound RTP audio received.", flush=True)
+                    received_audio = True
+                audio.extend(payload)
+                if pcmu_has_speech(payload):
+                    caller_speaking.set()
     except (OSError, ConnectionError) as error:
         errors.append(error)
         stop.set()
@@ -820,29 +813,7 @@ def live_session_event(
                 "format": {"type": "audio/pcmu", "rate": 8000},
                 "output": {"voice": voice},
             },
-            "delegation": {
-                "type": "responses",
-                "responses": {
-                    "model": backend_model,
-                    "instructions": BACKEND_GUIDANCE + "\n\n" + context,
-                    "tools": [{
-                        "type": "function", "name": "end_call",
-                        "description": "Record the outcome and hang up after the spoken goodbye.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"outcome": {
-                                "type": "string",
-                                "enum": ["completed", "unsuccessful", "other"],
-                            }},
-                            "required": ["outcome"],
-                            "additionalProperties": False,
-                        },
-                        "strict": True,
-                    }],
-                    "tool_choice": {"type": "function", "name": "end_call"},
-                    "parallel_tool_calls": False,
-                },
-            },
+            "delegation": {"type": "client"},
         },
     }
 
@@ -903,18 +874,21 @@ def finalize_live_session(
 
 
 class LiveCallEvents:
-    """Close at the native terminal handoff; classify the outcome separately."""
+    """Separate closing intent, spoken farewell, and playback completion."""
 
     def __init__(self, websocket: RawWebSocket, sender: RtpAudioSender | None = None) -> None:
         self.websocket = websocket
         self.sender = sender
         self.end_requested_at: float | None = None
         self.end_outcome: str | None = None
+        self.close_intent_at: float | None = None
+        self.goodbye_requested = False
+        self.revision = 0
+        self.input_revision = 0
+        self.last_context_change = time.monotonic()
         self.closing_delegation_id: str | None = None
         self.session_closing = False
         self.conversation_started = False
-        self.handled_calls: set[str] = set()
-        self.response_ids: dict[str, str] = {}
         self.transcripts: list[dict] = []
 
     def request_close(self) -> None:
@@ -922,19 +896,88 @@ class LiveCallEvents:
             self.end_requested_at = time.monotonic()
             if self.sender:
                 self.sender.finish()
-            print("Terminal handoff received; ending phone call.", flush=True)
+            print("Conversation finished; draining final speech before hangup.", flush=True)
+
+    def request_closing(self) -> None:
+        if self.close_intent_at is None:
+            self.close_intent_at = time.monotonic()
+            self.revision += 1
+            self.last_context_change = time.monotonic()
+            print("Closing requested; waiting for a spoken farewell.", flush=True)
+
+    def lifecycle_history(self) -> list[dict]:
+        history = []
+        for event in self.transcripts:
+            speaker = ('other_person' if event['type'] == 'session.input_transcript.delta'
+                       else 'agent')
+            if history and history[-1]['speaker'] == speaker:
+                history[-1]['text'] += event.get('delta', '')
+            else:
+                history.append({'speaker': speaker, 'text': event.get('delta', '')})
+        return history
+
+    def apply_review(self, revision: int, input_revision: int,
+                     decision: LifecycleDecision) -> None:
+        if (input_revision != self.input_revision
+                and not (decision.action == 'end' and decision.farewell_spoken)):
+            return  # The other person corrected or continued the conversation.
+        if decision.action != 'end' and revision != self.revision:
+            return  # Do not interrupt a newer answer with a stale farewell.
+        self.apply_lifecycle(decision)
+
+    def apply_lifecycle(self, decision: LifecycleDecision) -> None:
+        if self.end_requested_at is not None:
+            return
+        if decision.action == 'keep' and self.closing_delegation_id is not None:
+            self.websocket.send_json({
+                "type": "session.instructions.append",
+                "delegation_id": self.closing_delegation_id,
+                "content": "The conversation is still ongoing. Continue the task using "
+                           "the latest facts and listen for the other person's answer. "
+                           "Do not end the call or use an earlier closing decision.",
+            })
+            self.closing_delegation_id = None
+            self.close_intent_at = None
+        elif decision.action == 'end':
+            self.end_outcome = decision.outcome
+            print(f"Lifecycle decided to end: {decision.reason}", flush=True)
+            self.request_close()
+        elif decision.action == 'say_goodbye' and not self.goodbye_requested:
+            self.goodbye_requested = True
+            self.websocket.send_json({
+                "type": "session.commentary.append",
+                "delegation_id": self.closing_delegation_id,
+                "content": decision.message,
+            })
+            print("Lifecycle requested a brief spoken farewell.", flush=True)
+
+    def pause_pending_farewell(self) -> None:
+        if not self.goodbye_requested or self.end_requested_at is not None or self.session_closing:
+            return
+        self.goodbye_requested = False
+        self.close_intent_at = None
+        self.end_outcome = None
+        if self.closing_delegation_id is not None:
+            self.closing_delegation_id = None
+        self.websocket.send_json({
+            "type": "session.instructions.append", "delegation_id": None,
+            "content": "The other person is speaking again. Cancel the previous pending "
+                       "closing statement if you have not said it yet; its facts may be stale. "
+                       "Listen to the complete new utterance and use its corrected facts. "
+                       "If you already delivered your final farewell, remain silent instead. "
+                       "Do not repeat the old closing statement.",
+        })
+        print("New caller input paused the pending farewell.", flush=True)
 
     def handle(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "session.delegation.created":
             delegation = event.get("delegation", {})
-            # This session exposes exactly one capability: terminal end_call.
-            # The model's native handoff is already the closing decision. Do
-            # not keep the telephone open while a backend classifies outcome.
-            if delegation.get("target") == "responses" and delegation.get("id"):
+            # A handoff expresses closing intent, not farewell completion.
+            if delegation.get("target") == "client" and delegation.get("id"):
                 if self.closing_delegation_id is None:
                     self.closing_delegation_id = delegation["id"]
-                    self.request_close()
+                    self.request_closing()
             return
         if kind == "session.output_audio.delta":
             if self.sender and self.end_requested_at is None:
@@ -949,60 +992,20 @@ class LiveCallEvents:
         if kind in ("session.input_transcript.delta", "session.output_transcript.delta"):
             self.conversation_started = True
             self.transcripts.append(event)
+            self.revision += 1
+            if kind == "session.input_transcript.delta":
+                self.input_revision += 1
+                self.pause_pending_farewell()
+            self.last_context_change = time.monotonic()
             speaker = "Other person" if kind == "session.input_transcript.delta" else "Agent"
             # Preserve each fragment exactly: Live has no turn-completed event.
             print(f"{speaker} [{event.get('start_ms')}–{event.get('end_ms')} ms]: "
                   f"{event.get('delta', '')}", flush=True)
-        elif kind == "response.event":
-            nested = event.get("event", {})
-            if nested.get("type") == "response.output_text.delta":
-                print(f"Backend (not spoken): {nested.get('delta', '')}", flush=True)
-            delegation_id = event.get("delegation_id", "")
-            response_id = nested.get("response", {}).get("id")
-            if nested.get("type") == "response.created" and response_id:
-                self.response_ids[delegation_id] = response_id
-            if nested.get("type") == "response.output_item.done":
-                item = nested.get("item", {})
-                if item.get("type") != "function_call":
-                    return
-                call_id = item.get("call_id")
-                if not call_id:
-                    raise RuntimeError("Delegated function has no call_id")
-                if call_id in self.handled_calls:
-                    return
-                if self.end_requested_at is not None and (
-                    self.end_outcome is not None
-                    or (self.closing_delegation_id is not None
-                        and delegation_id != self.closing_delegation_id)
-                ):
-                    return
-                self.handled_calls.add(call_id)
-                tool_response_id = nested.get("response_id") or self.response_ids.get(delegation_id)
-                if not tool_response_id:
-                    raise RuntimeError("Delegated function has no associated response")
-                arguments = json.loads(item.get("arguments", "{}"))
-                outcome = arguments.get("outcome")
-                if item.get("name") != "end_call" or outcome not in {
-                    "completed", "unsuccessful", "other"
-                }:
-                    raise RuntimeError("Invalid terminal function or outcome")
-                else:
-                    self.request_close()
-                    self.end_outcome = outcome
-                    result = {"ok": True, "outcome": outcome}
-                    print(f"Call outcome: {outcome}", flush=True)
-                if not self.session_closing:
-                    self.websocket.send_json({
-                        "type": "response.item.create",
-                        "item": {"type": "function_call_output", "call_id": call_id,
-                                 "output": json.dumps(result)},
-                    })
-            elif nested.get("type") in ("response.failed", "response.incomplete"):
-                raise RuntimeError(f"Delegated backend failed: {nested.get('response')}")
 
 
 def bridge_live(
     client: SipClient, call: ActiveCall, websocket: RawWebSocket, max_seconds: float,
+    lifecycle: LifecycleReviewer | None = None,
 ) -> tuple[bool, LiveCallEvents]:
     stop = threading.Event()
     remote_hangup = threading.Event()
@@ -1024,6 +1027,8 @@ def bridge_live(
     sip_thread.start()
     events = LiveCallEvents(websocket, sender)
     greeting_sent = False
+    reviewed_revision = -1
+    retry_after = 0.0
     try:
         while not stop.is_set() and time.monotonic() - started < max_seconds:
             if sender.error:
@@ -1037,6 +1042,23 @@ def bridge_live(
                                "to the call instructions, then listen.",
                 })
                 greeting_sent = True
+            if lifecycle is not None and events.end_requested_at is None:
+                result = lifecycle.poll()
+                if result is not None:
+                    revision, input_revision, decision = result
+                    if isinstance(decision, Exception):
+                        print(f"Lifecycle review failed: {decision}", flush=True)
+                        reviewed_revision = -1
+                        retry_after = now + 2
+                    else:
+                        events.apply_review(revision, input_revision, decision)
+                if (not lifecycle.pending and events.transcripts
+                        and events.revision != reviewed_revision and now >= retry_after
+                        and now - events.last_context_change >= .5
+                        and sender.speech_drained(.4)):
+                    reviewed_revision = events.revision
+                    lifecycle.submit(events.revision, events.input_revision,
+                                     events.lifecycle_history(), events.close_intent_at is not None)
             if events.end_requested_at is not None and sender.speech_drained():
                 break
             try:
@@ -1054,6 +1076,8 @@ def bridge_live(
             raise errors[0]
     finally:
         stop.set()
+        if lifecycle is not None:
+            lifecycle.close()
         rtp_thread.join(timeout=2)
         sip_thread.join(timeout=2)
         sender.stop()
@@ -1237,7 +1261,8 @@ def main() -> int:
             args.model, args.backend_model, args.voice, args.instructions
         ))
         remote_hung_up, events = bridge_live(
-            client, call, websocket, args.max_call_seconds
+            client, call, websocket, args.max_call_seconds,
+            LifecycleReviewer(api_key, args.backend_model, args.instructions, calendar_context()),
         )
         sip_ended = remote_hung_up
         if not remote_hung_up:
