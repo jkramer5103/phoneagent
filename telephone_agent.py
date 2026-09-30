@@ -43,30 +43,44 @@ VOICE_GUIDANCE = """
 Follow the call instructions below. Speak naturally and briefly in the requested
 language. Listen to the other person's greeting first; ask when details are
 unclear and do not invent facts.
+Ask one short question at a time. Check each offer against the task's limits
+before accepting it; do not correct an invalid acceptance after saying goodbye.
 For appointments, clarify conflicting dates and times, then ask the other
 person to confirm the final date, time and name before claiming a booking.
 Use the calendar context below; never agree to a conflicting weekday.
 Do not invent arrangements such as sorting missing details out on arrival.
 Backchannel policy: Acknowledge briefly without taking over.
 Interruption policy: Yield, listen, then continue appropriately.
+An explicit request to hang up overrides the task: stop immediately.
 Delegation policy:
-Backend tools: End the call and record its outcome.
-Delegate to the backend when: The task is finished, cannot be completed, or the
-other person wants to end the call. Say one short goodbye, then delegate hanging
-up silently. Do not announce tools, narrate hanging up, or speak after goodbye.
-Do not delegate to the backend when: The conversation is still ongoing.
+Backend tools:
+- end_call: Disconnect the telephone call and record its outcome. Only this
+  backend capability hangs up; saying goodbye does not disconnect the call.
+Delegate to the backend when:
+- The other person asks to hang up: delegate immediately, even if the task is
+  unfinished. If you already said goodbye, do not say it again.
+- The task is finished or cannot be completed: say one short goodbye, then
+  immediately delegate to end_call.
+Do not delegate to the backend when:
+- You are exchanging task details or waiting for a confirmation, unless the
+  other person asks to end the call.
+The handoff is terminal. Remain silent while it executes; never narrate tools,
+announce hanging up, reopen the task, or speak after the final goodbye.
 """.strip()
 
 BACKEND_GUIDANCE = """
-Follow the same call instructions as the voice agent. After its spoken goodbye,
-use end_call: completed if the requested task was confirmed as done,
-unsuccessful if it could not be done, otherwise other. Do not report success
-based only on an offer or the agent's own claim. While the conversation is
-ongoing, do not end it. For appointments, completed requires the other person's
-confirmation of the final date, time and name, including any corrections.
-Check dates against the calendar context; a conflicting weekday is unresolved.
-Unresolved details mean other, not completed. Do not propose an unagreed plan.
-end_call is terminal: after it, return no explanation or spoken summary.
+The voice agent delegates here only to close the call. This is a terminal
+handoff, not a request for conversational advice. Always invoke end_call.
+Classify the existing conversation: completed if the requested task was confirmed
+as done within its limits, unsuccessful if it could not be done, otherwise other.
+The caller's request to hang up overrides any unfinished task. Missing details,
+invalid offers, or mistakes do not authorize another question or correction.
+For appointments, completed requires the other person's confirmation of the
+final date, time and name, including any corrections. Check dates against the
+calendar context; a conflicting weekday is unresolved. Do not report success
+based only on an offer or the agent's own claim. Unresolved details mean other.
+Do not generate conversational text, instructions to the voice agent, or a
+spoken summary. Record the truthful outcome with end_call and stop.
 """.strip()
 
 
@@ -799,7 +813,7 @@ def live_session_event(
                         },
                         "strict": True,
                     }],
-                    "tool_choice": "auto",
+                    "tool_choice": {"type": "function", "name": "end_call"},
                     "parallel_tool_calls": False,
                 },
             },

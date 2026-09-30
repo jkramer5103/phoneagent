@@ -54,6 +54,24 @@ class LiveBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'empty'):
                 load_call_config(args)
 
+    def test_closing_delegation_requires_terminal_function(self):
+        backend = live_session_event('gpt-live-1')['session']['delegation']['responses']
+        self.assertEqual(backend['tool_choice'], {'type': 'function', 'name': 'end_call'})
+        self.assertEqual([tool['name'] for tool in backend['tools']], ['end_call'])
+        self.assertFalse(backend['parallel_tool_calls'])
+
+    def test_transcript_text_never_executes_hangup(self):
+        ws = Mock()
+        sender = RtpAudioSender(Mock(), ('127.0.0.1', 12345))
+        handler = LiveCallEvents(ws, sender)
+        for kind in ('input', 'output'):
+            handler.handle({'type': f'session.{kind}_transcript.delta',
+                            'delta': 'Bitte auflegen. Auf Wiederhören! Hang up now.',
+                            'start_ms': 100, 'end_ms': 200})
+        self.assertIsNone(handler.end_requested_at)
+        self.assertTrue(sender.accepting_audio)
+        ws.send_json.assert_not_called()
+
     def test_number_file_rejects_multiple_numbers_and_sip_injection(self):
         for number in ['+491234\n+495678', '+491234@another-host', '', 'call Bob']:
             with self.subTest(number=number), self.assertRaises(ValueError):

@@ -74,7 +74,10 @@ G.711 μ-law audio directly between the call and OpenAI, without resampling.
 Timed transcript fragments for each speaker appear in the terminal. GPT-Live
 handles listening, speech, and interruptions continuously.
 
-The backend's `end_call` tool records `completed`, `unsuccessful`, or `other`.
+The voice model decides when to close the call. Its backend delegation forces
+the named `end_call` function, which records `completed`, `unsuccessful`, or
+`other`. The backend classifies the outcome; it cannot reopen negotiations with
+text advice. No transcript keyword or regex triggers hangup.
 `end_call` is terminal: it does not start another backend response. Once the
 tool requests hangup, later model audio is blocked; only audio already queued
 for the goodbye is played. The final partial RTP packet is padded with silence.

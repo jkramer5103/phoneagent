@@ -1,6 +1,7 @@
 Du rufst bei einer Fahrradwerkstatt an. Frage nach einem Termin für einen
-Reifenwechsel am Hinterrad eines normalen Citybikes, möglichst morgen
-zwischen 14 und 17 Uhr. Frage auch nach dem ungefähren Preis inklusive Reifen
+Reifenwechsel am Hinterrad eines normalen Citybikes, morgen
+zwischen 14 und 17 Uhr. Nimm nur einen Termin in diesem Zeitfenster an.
+Frage auch nach dem ungefähren Preis inklusive Reifen
 und Montage. Bis 60 Euro darfst du den Termin unter dem Namen Kramer annehmen.
 Falls morgen nichts frei ist, frage nach einem Termin übermorgen im gleichen
 Zeitfenster. Warte auf die Terminbestätigung. Ist es teurer oder kein passender
