@@ -43,11 +43,16 @@ VOICE_GUIDANCE = """
 Follow the call instructions below. Speak naturally and briefly in the requested
 language. Listen to the other person's greeting first; ask when details are
 unclear and do not invent facts.
+Use concise, direct sentences without filler or repeated confirmations.
+Corrections replace earlier details: acknowledge once, then use the corrected
+value. Never defend a mistaken value. Check sums before quoting a total
+(for example, 30 plus 20 is 50). If a price is unclear, ask instead of guessing.
 Ask one short question at a time. Check each offer against the task's limits
 before accepting it; do not correct an invalid acceptance after saying goodbye.
 For appointments, clarify conflicting dates and times, then ask the other
 person to confirm the final date, time and name before claiming a booking.
-Use the calendar context below; never agree to a conflicting weekday.
+Use the calendar context below. If a weekday conflicts, ask for the exact
+date and weekday together; a repeated "tomorrow" does not resolve the conflict.
 Do not invent arrangements such as sorting missing details out on arrival.
 Backchannel policy: Acknowledge briefly without taking over.
 Interruption policy: Yield, listen, then continue appropriately.
@@ -60,7 +65,8 @@ Delegate to the backend when:
 - The other person asks to hang up: delegate immediately, even if the task is
   unfinished. If you already said goodbye, do not say it again.
 - The task is finished or cannot be completed: say one short goodbye, then
-  immediately delegate to end_call.
+  immediately delegate to end_call. A confirmed booking needs no further
+  conversational turns. Do not wait for the person to ask you to disconnect.
 Do not delegate to the backend when:
 - You are exchanging task details or waiting for a confirmation, unless the
   other person asks to end the call.
@@ -846,11 +852,15 @@ def start_live_session(websocket: RawWebSocket, config: dict, timeout: float = 1
     raise TimeoutError("No session.started received from GPT-Live")
 
 
-def finalize_live_session(websocket: RawWebSocket, timeout: float = 15) -> bool:
+def finalize_live_session(
+    websocket: RawWebSocket, timeout: float = 15, events: LiveCallEvents | None = None,
+) -> bool:
     if websocket.finalized:
         return True
     if not websocket.started or websocket.closed:
         return False
+    if events is not None:
+        events.session_closing = True
     websocket.send_json({"type": "session.close"})
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -865,27 +875,47 @@ def finalize_live_session(websocket: RawWebSocket, timeout: float = 15) -> bool:
             websocket.finalized = True
             print(f"Final Live usage: {json.dumps(event.get('usage', {}))}")
             return True
-        if event.get("type") == "error":
+        if events is not None:
+            events.handle(event)
+        elif event.get("type") == "error":
             raise live_error(event)
     raise TimeoutError("Incomplete Live finalization: no session.closed event")
 
 
 class LiveCallEvents:
-    """Track delegated tools independently of the continuous voice stream."""
+    """Close at the native terminal handoff; classify the outcome separately."""
 
     def __init__(self, websocket: RawWebSocket, sender: RtpAudioSender | None = None) -> None:
         self.websocket = websocket
         self.sender = sender
         self.end_requested_at: float | None = None
         self.end_outcome: str | None = None
+        self.closing_delegation_id: str | None = None
+        self.session_closing = False
         self.conversation_started = False
         self.handled_calls: set[str] = set()
-        self.pending_results: set[str] = set()
         self.response_ids: dict[str, str] = {}
         self.transcripts: list[dict] = []
 
+    def request_close(self) -> None:
+        if self.end_requested_at is None:
+            self.end_requested_at = time.monotonic()
+            if self.sender:
+                self.sender.finish()
+            print("Terminal handoff received; ending phone call.", flush=True)
+
     def handle(self, event: dict) -> None:
         kind = event.get("type")
+        if kind == "session.delegation.created":
+            delegation = event.get("delegation", {})
+            # This session exposes exactly one capability: terminal end_call.
+            # The model's native handoff is already the closing decision. Do
+            # not keep the telephone open while a backend classifies outcome.
+            if delegation.get("target") == "responses" and delegation.get("id"):
+                if self.closing_delegation_id is None:
+                    self.closing_delegation_id = delegation["id"]
+                    self.request_close()
+            return
         if kind == "session.output_audio.delta":
             if self.sender and self.end_requested_at is None:
                 self.sender.add(base64.b64decode(event.get("delta", "")))
@@ -920,8 +950,12 @@ class LiveCallEvents:
                     raise RuntimeError("Delegated function has no call_id")
                 if call_id in self.handled_calls:
                     return
-                if self.end_requested_at is not None:
-                    return  # A terminal tool cannot start another conversation.
+                if self.end_requested_at is not None and (
+                    self.end_outcome is not None
+                    or (self.closing_delegation_id is not None
+                        and delegation_id != self.closing_delegation_id)
+                ):
+                    return
                 self.handled_calls.add(call_id)
                 tool_response_id = nested.get("response_id") or self.response_ids.get(delegation_id)
                 if not tool_response_id:
@@ -931,35 +965,25 @@ class LiveCallEvents:
                 if item.get("name") != "end_call" or outcome not in {
                     "completed", "unsuccessful", "other"
                 }:
-                    result = {"ok": False, "error": "Unsupported function or outcome"}
+                    raise RuntimeError("Invalid terminal function or outcome")
                 else:
-                    if self.end_requested_at is None:
-                        self.end_requested_at = time.monotonic()
+                    self.request_close()
                     self.end_outcome = outcome
-                    if self.sender:
-                        self.sender.finish()
                     result = {"ok": True, "outcome": outcome}
-                    print(f"Agent requested hangup: {outcome}")
-                self.websocket.send_json({
-                    "type": "response.item.create",
-                    "item": {"type": "function_call_output", "call_id": call_id,
-                             "output": json.dumps(result)},
-                })
-                # Forwarded item events don't include a response_id. Use the
-                # response.created envelope for this delegation instead.
-                if self.end_requested_at is None:
-                    self.pending_results.add(tool_response_id)
-            elif nested.get("type") == "response.completed":
-                if response_id in self.pending_results and self.end_requested_at is None:
-                    self.pending_results.remove(response_id)
-                    self.websocket.send_json({"type": "response.create"})
+                    print(f"Call outcome: {outcome}", flush=True)
+                if not self.session_closing:
+                    self.websocket.send_json({
+                        "type": "response.item.create",
+                        "item": {"type": "function_call_output", "call_id": call_id,
+                                 "output": json.dumps(result)},
+                    })
             elif nested.get("type") in ("response.failed", "response.incomplete"):
                 raise RuntimeError(f"Delegated backend failed: {nested.get('response')}")
 
 
 def bridge_live(
     client: SipClient, call: ActiveCall, websocket: RawWebSocket, max_seconds: float,
-) -> bool:
+) -> tuple[bool, LiveCallEvents]:
     stop = threading.Event()
     remote_hangup = threading.Event()
     caller_speaking = threading.Event()
@@ -1013,7 +1037,7 @@ def bridge_live(
         rtp_thread.join(timeout=2)
         sip_thread.join(timeout=2)
         sender.stop()
-    return remote_hangup.is_set()
+    return remote_hangup.is_set(), events
 
 
 def check_live_api(args: argparse.Namespace, api_key: str) -> int:
@@ -1192,7 +1216,7 @@ def main() -> int:
         start_live_session(websocket, live_session_event(
             args.model, args.backend_model, args.voice, args.instructions
         ))
-        remote_hung_up = bridge_live(
+        remote_hung_up, events = bridge_live(
             client, call, websocket, args.max_call_seconds
         )
         sip_ended = remote_hung_up
@@ -1202,7 +1226,7 @@ def main() -> int:
             print("Call ended cleanly.")
         else:
             print("Remote party ended the call.")
-        finalize_live_session(websocket)
+        finalize_live_session(websocket, events=events)
         return 0
     except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as error:
         print(f"Error: {error}")

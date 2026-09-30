@@ -17,7 +17,7 @@ from telephone_agent import (
     pcmu_has_speech, rtp_payload, start_live_session, stream_rtp_to_live,
     load_call_config, normalize_number,
     local_lan_interface, parse_args,
-    calendar_context,
+    calendar_context, bridge_live, finalize_live_session,
 )
 
 
@@ -164,6 +164,63 @@ class LiveBridgeTests(unittest.TestCase):
         finally:
             sender.stop()
 
+    def test_native_handoff_closes_before_slow_outcome_backend(self):
+        rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rtp.bind(('127.0.0.1', 0))
+        rtp.settimeout(.02)
+        sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sink.bind(('127.0.0.1', 0))
+        ws = Mock()
+        queue = [
+            {'type': 'session.output_audio.delta',
+             'delta': base64.b64encode(b'\x90' * 197).decode()},
+            {'type': 'session.delegation.created',
+             'delegation': {'id': 'd', 'target': 'responses'}},
+            {'type': 'session.output_audio.delta',
+             'delta': base64.b64encode(b'\x90' * 8000).decode()},
+        ]
+        def receive():
+            if queue:
+                return json.dumps(queue.pop(0))
+            # The backend has not supplied any outcome or function call.
+            time.sleep(.02)
+            raise socket.timeout()
+        ws.recv_text.side_effect = receive
+        try:
+            started = time.monotonic()
+            with patch('telephone_agent.monitor_sip'):
+                remote, events = bridge_live(Mock(), Mock(rtp=rtp, rtp_target=sink.getsockname()),
+                                             ws, max_seconds=5)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertFalse(remote)
+            self.assertIsNotNone(events.end_requested_at)
+            self.assertIsNone(events.end_outcome)
+            self.assertEqual(events.sender.received_bytes, 197)
+        finally:
+            rtp.close()
+            sink.close()
+
+    def test_outcome_finishes_after_phone_disconnect_without_more_speech(self):
+        ws = Mock(started=True, finalized=False, closed=False)
+        handler = LiveCallEvents(ws)
+        handler.handle({'type': 'session.delegation.created',
+                        'delegation': {'id': 'd', 'target': 'responses'}})
+        closing_time = handler.end_requested_at
+        ws.recv_text.side_effect = [json.dumps(event) for event in [
+            {'type': 'response.event', 'delegation_id': 'd', 'event': {
+                'type': 'response.created', 'response': {'id': 'r'}}},
+            {'type': 'response.event', 'delegation_id': 'd', 'event': {
+                'type': 'response.output_item.done', 'item': {
+                    'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
+                    'arguments': '{"outcome":"other"}'}}},
+            {'type': 'session.closed', 'usage': {'seconds': 10}},
+        ]]
+        self.assertTrue(finalize_live_session(ws, events=handler))
+        self.assertEqual(handler.end_outcome, 'other')
+        self.assertEqual(handler.end_requested_at, closing_time)
+        self.assertEqual([call.args[0]['type'] for call in ws.send_json.call_args_list],
+                         ['session.close'])
+
     def test_calendar_uses_berlin_weekdays_and_month_rollover(self):
         context = calendar_context(datetime(2026, 9, 30, 13, tzinfo=ZoneInfo('Europe/Berlin')))
         self.assertIn('Heute / today: Mittwoch, 2026-09-30', context)
@@ -172,24 +229,24 @@ class LiveBridgeTests(unittest.TestCase):
         context = calendar_context(datetime(2026, 9, 30, 23, tzinfo=ZoneInfo('UTC')))
         self.assertIn('Heute / today: Donnerstag, 2026-10-01', context)
 
-    def test_invalid_tool_cannot_schedule_hangup(self):
+    def test_invalid_tool_fails_without_restarting_conversation(self):
         ws = Mock()
         handler = LiveCallEvents(ws)
         handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
             'type': 'response.created', 'response': {'id': 'r'},
         }})
-        handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
-            'type': 'response.output_item.done', 'item': {
-                'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
-                'arguments': '{"outcome":"invalid"}',
-            },
-        }})
+        with self.assertRaisesRegex(RuntimeError, 'Invalid terminal'):
+            handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
+                'type': 'response.output_item.done', 'item': {
+                    'type': 'function_call', 'call_id': 'c', 'name': 'end_call',
+                    'arguments': '{"outcome":"invalid"}',
+                },
+            }})
         self.assertIsNone(handler.end_requested_at)
-        self.assertFalse(json.loads(ws.send_json.call_args.args[0]['item']['output'])['ok'])
         handler.handle({'type': 'response.event', 'delegation_id': 'd', 'event': {
             'type': 'response.completed', 'response': {'id': 'r'},
         }})
-        self.assertEqual(ws.send_json.call_args.args[0], {'type': 'response.create'})
+        ws.send_json.assert_not_called()
 
     def test_both_transcript_streams_keep_exact_fragments_and_times(self):
         handler = LiveCallEvents(Mock())

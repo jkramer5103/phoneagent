@@ -78,9 +78,11 @@ The voice model decides when to close the call. Its backend delegation forces
 the named `end_call` function, which records `completed`, `unsuccessful`, or
 `other`. The backend classifies the outcome; it cannot reopen negotiations with
 text advice. No transcript keyword or regex triggers hangup.
-`end_call` is terminal: it does not start another backend response. Once the
-tool requests hangup, later model audio is blocked; only audio already queued
-for the goodbye is played. The final partial RTP packet is padded with silence.
+Because the only delegated capability is terminal `end_call`, the native
+`session.delegation.created` event begins closing immediately. Outcome reasoning
+runs separately and cannot delay the telephone disconnect. No new model audio
+is accepted after the handoff; only the already queued final speech is played.
+`end_call` does not start another backend response. The final partial RTP packet is padded with silence.
 The script waits for that speech to play plus a second of quiet output before
 hanging up. This quiet interval uses a local audio-energy
 heuristic because Live has no speech-completed event. Remote hangups and the
