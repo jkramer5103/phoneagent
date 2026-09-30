@@ -61,7 +61,7 @@ python3 telephone_agent.py --instructions-file my-task.txt --number-file my-numb
 `--destination` overrides the number file for one call. `--help` lists all options.
 Defaults: Speedport `192.168.2.1:5060`, extension `**72`, SIP username
 `nutzer-2@speedport.ip`, voice `marin`, voice model `gpt-live-1`, backend
-`gpt-6-luna`. The script waits up to 45 seconds for an answer; calls last at most
+`gpt-6-sol`. The script waits up to 45 seconds for an answer; calls last at most
 180 seconds by default (`--max-call-seconds`).
 
 Calls run on this machine by default. The agent detects a directly attached
@@ -88,7 +88,10 @@ handles listening, speech, and interruptions continuously.
 
 A closing handoff records intent; it does not immediately disconnect the phone.
 A separate lifecycle reviewer uses the backend model and Structured Outputs to
-assess the full conversation after speech pauses. It distinguishes ongoing
+assess the full conversation after speech pauses. Before deciding whether to
+close, it extracts task status and material open questions with transcript
+evidence. The application rejects a closing decision that contradicts this task
+state; an overlooked option gets a clarification instead. It distinguishes ongoing
 conversation, a missing farewell, and a completed closing statement. If a
 farewell is missing, it requests one brief statement from GPT-Live. It can also
 recognize a spoken closing when GPT-Live omitted its native delegation.

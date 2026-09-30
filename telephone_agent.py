@@ -51,8 +51,10 @@ Decisions:
 Use only the user's goal, constraints and facts, plus facts learned in this call.
 Do not add personal preferences, extra requirements, reasons or arrangements.
 Carry out the requested action when its stated conditions are met. An inclusive
-maximum allows exactly that amount. Respect explicit conditions for stopping;
-do not negotiate or change the task if the user instructed you to stop instead.
+maximum allows exactly that amount. Apply a stopping condition once its facts
+are established. One unsuitable option does not rule out other options the
+provider has offered. Clarifying their missing terms stays within the task;
+do not invent alternatives or disregard an explicit prohibition on alternatives.
 An information request needs an answer, not an unsolicited booking or purchase.
 Evaluate the latest offer, not a rejected earlier one. Corrections replace earlier
 facts; acknowledge once and recalculate totals from the current components.
@@ -802,7 +804,7 @@ def stream_rtp_to_live(
 
 
 def live_session_event(
-    model: str, backend_model: str = "gpt-6-luna", voice: str = "marin",
+    model: str, backend_model: str = "gpt-6-sol", voice: str = "marin",
     instructions: str = "Say hello briefly.",
 ) -> dict:
     context = calendar_context() + "\n\nCall instructions:\n" + instructions
@@ -965,7 +967,7 @@ class LiveCallEvents:
                 "delegation_id": self.closing_delegation_id,
                 "content": decision.message,
             })
-            print("Lifecycle requested a brief spoken farewell.", flush=True)
+            print(f"Lifecycle requested a brief spoken farewell: {decision.reason}", flush=True)
 
     def pause_pending_farewell(self) -> None:
         if not self.goodbye_requested or self.end_requested_at is not None or self.session_closing:
@@ -1197,7 +1199,7 @@ def parse_args() -> argparse.Namespace:
                         help="Text file containing the phone number")
     parser.add_argument("--destination", help="Override the number file for this call")
     parser.add_argument("--model", default="gpt-live-1")
-    parser.add_argument("--backend-model", default="gpt-6-luna")
+    parser.add_argument("--backend-model", default="gpt-6-sol")
     parser.add_argument("--voice", default="marin")
     parser.add_argument("--check-api", action="store_true",
                         help="Test Live audio and session lifecycle without dialing")

@@ -3,12 +3,16 @@
 Run from the project directory: python3 tests/eval_call_lifecycle.py
 Requires OPENAI_API_KEY in the environment or .env; incurs API usage.
 """
-import sys, time
+import sys, time, argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from call_lifecycle import review_lifecycle
 from telephone_agent import load_env_value, calendar_context
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--model', default='gpt-6-sol')
+parser.add_argument('--repeat', type=int, default=1)
+args = parser.parse_args()
 key=load_env_value('OPENAI_API_KEY')
 if not key:
  raise SystemExit('Missing OPENAI_API_KEY')
@@ -57,14 +61,36 @@ cases += [
  message('other_person','Unser einziges freies Zimmer kostet 110 Euro. Günstiger geht es nicht.'),
  message('agent','Das liegt über meinem Rahmen. Vielen Dank, auf Wiederhören.')], 'end'),
 ]
+# Preserve the imperfect transcript, rather than rewriting it into clean speech.
+full_task = """Du rufst bei einer Fahrradwerkstatt an. Frage nach einem Termin für einen
+Reifenwechsel am Hinterrad eines normalen Citybikes, morgen
+zwischen 14 und 17 Uhr. Nimm nur einen Termin in diesem Zeitfenster an.
+Frage auch nach dem ungefähren Preis inklusive Reifen
+und Montage. Bis 60 Euro darfst du den Termin unter dem Namen Kramer annehmen.
+Falls morgen nichts frei ist, frage nach einem Termin übermorgen im gleichen
+Zeitfenster. Warte auf die Terminbestätigung. Ist es teurer oder kein passender
+Termin frei, bedanke dich und beende das Gespräch ohne Buchung. Sprich kurz
+und freundlich auf Deutsch; erfinde keine weiteren Angaben."""
+last_offer = ('Ja, das ist nicht ganz ideal, aber sollte passen. Wir hätten für unsere '
+              'neuen Extraplatz für den Reifen ein Sonderangebot. 40 Euro für den Reifen, '
+              'ist nicht ganz günstig. Das lohnt sich aber. Haben Sie dann auch die '
+              'günstigere aber würde eigentlich platt- äh plattfesten empfehlen. '
+              'Und dann noch 30 Euro für die Montage. Passt das für Sie? '
+              'Äh 16 Uhr übrigens der Termin.')
+for ending in ('Einen Moment, ich rechne kurz.',
+               'Danke für die Auskunft. Dann buche ich den Termin nicht. Auf Wiederhören.'):
+ cases.append(('verbatim-failed-call-' + ending[:5], full_task, True, [
+  message('agent','Kann man auch ohne die Angabe einen Termin dafür bekommen?'),
+  message('other_person',last_offer), message('agent',ending)], 'keep'))
+
 def run(case):
  name,task,pending,history,expected=case
  started=time.monotonic()
- decision=review_lifecycle(key,'gpt-6-luna',{'task':task,'calendar':calendar_context(),'history':history,'native_closing_pending':pending})
+ decision=review_lifecycle(key,args.model,{'task':task,'calendar':calendar_context(),'history':history,'native_closing_pending':pending})
  print(name,round(time.monotonic()-started,2),decision,flush=True)
  assert decision.action==expected,(name,decision.action,expected)
- if name in {'actual-call-overlooked-cheaper-option', 'generic-overlooked-alternative'}:
+ if name in {'actual-call-overlooked-cheaper-option', 'generic-overlooked-alternative'} or name.startswith('verbatim-failed-call'):
   assert decision.message.strip(), (name, 'Missing clarification')
 with ThreadPoolExecutor(max_workers=2) as pool:
- list(pool.map(run,cases))
+ list(pool.map(run,cases * args.repeat))
 print('All semantic lifecycle cases passed.')
