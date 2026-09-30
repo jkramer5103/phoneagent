@@ -15,3 +15,8 @@ venv
 
 # Recordings
 recordings
+
+# Local call logs and credentials
+*.log
+.env.*
+!.env.example

@@ -1,0 +1,6 @@
+Reserviere bei der Pizzeria am Neuen Wall einen Tisch für zwei Personen auf
+den Namen Kramer. Jede angebotene Uhrzeit zwischen 19:30 und 20:30 Uhr passt.
+Sprich freundlich und kurz auf Deutsch. Lass zuerst die Begrüßung enden.
+Warte auf die ausdrückliche Bestätigung der Reservierung, bedanke dich dann
+und verabschiede dich. Falls keine passende Zeit frei ist, verabschiede dich
+freundlich. Erfinde keine fehlenden Angaben, etwa ein nicht genanntes Datum.
